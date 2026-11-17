@@ -9,6 +9,25 @@ The project combines an interactive **React Three Fiber** scene with a multi-age
 **LangGraph** and **FastAPI**. LLMs are accessed through **OpenRouter**, so every agent can use a
 different model.
 
+## Examples
+
+Two rooms designed by the agents from a single prompt each:
+
+<table>
+  <tr>
+    <th width="50%">Daughter's bedroom</th>
+    <th width="50%">Studio apartment</th>
+  </tr>
+  <tr>
+    <td><img src="docs/images/daughter-room.png" alt="Bedroom designed by the agents: canopy bed with pink bedding, desk with chair and bookshelf, wardrobe, bean bag on a rug, floor lamp, pictures on the walls"></td>
+    <td><img src="docs/images/studio-apartment.png" alt="Studio apartment designed by the agents: bed, wardrobe, kitchenette, dining table for four and a TV corner with four armchairs"></td>
+  </tr>
+  <tr>
+    <td valign="top"><em>"I want to design a bedroom for my young daughter with a pink and pastel color theme. The room should feel cozy, playful, and welcoming, with space for sleeping, playing, studying, and storing her toys and clothes."</em></td>
+    <td valign="top"><em>"I live alone in a studio apartment with a separate bathroom. Suggest a practical and comfortable layout that includes everything I need for daily living. The space should also accommodate three friends occasionally coming over for dinner and watching TV."</em></td>
+  </tr>
+</table>
+
 ## Features
 
 ### Interactive 3D room planner
