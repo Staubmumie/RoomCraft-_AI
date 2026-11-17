@@ -28,14 +28,15 @@ from pydantic import BaseModel, Field
 
 import inventory
 from design.layout_validator import correction_messages
-from furniture.store import get_store
-from design.routing import limit, remaining
+from design.routing import MAX_ITEMS_PER_REQUEST, limit, remaining
 from design.scene_images import image_content, load_scene_images
 from design.state import DesignState, Furniture, add_counts, model_for
 from design.working_layout import (STALE_RENDER_VERSIONS, added_pieces, changes_since_render, current_version,
                                    has_proposal, is_substantial, layout_furniture, removed_ids)
+from furniture.store import get_store
 from llm import LLMError, structured_completion
 from observability import progress
+from prompts import load_prompt
 
 Action = Literal["validate", "request_furniture", "request_critique", "finish"]
 RepairStrategy = Literal["none", "shift", "rotate", "relocate", "regroup", "remove"]
@@ -61,11 +62,18 @@ class NewPiece(BaseModel):
     rotation_deg: float
 
 
-class FurnitureRequest(BaseModel):
-    description: str = Field(description="What is missing, e.g. 'small side table next to the sofa'")
+class FurnitureItemRequest(BaseModel):
+    description: str = Field(description="One missing piece, e.g. 'small side table next to the sofa'")
+    purpose: str | None = Field(description="Zone / function it serves, e.g. 'sofa corner: put down drinks'")
+    size: str | None = Field(description="Size limits in metres that fit the free space, if relevant")
     style: str | None
-    size: str | None = Field(description="Size constraints in metres, if relevant")
     colors_materials: str | None
+    essential: bool = Field(description="true if a wish or core function of the room cannot work without it")
+
+
+class FurnitureRequest(BaseModel):
+    items: list[FurnitureItemRequest] = Field(description="Every piece still missing, essential ones first")
+    style: str | None = Field(description="Style for the whole list, if any")
     budget: str | None
 
 
@@ -83,8 +91,10 @@ class Zone(BaseModel):
 class DesignPlan(BaseModel):
     requirements: list[str] = Field(description="Functions the room must support: explicit wishes of the request first, "
                                                 "then existing uses of the room that should be kept")
-    zones: list[Zone] = Field(description="Functional zones; only those the request and room actually need")
-    composition: str = Field(description="How the zones sit relative to each other, main walkways, free areas and visual balance")
+    zones: list[Zone] = Field(description="Functional zones the request and the room call for; in a spacious "
+                                                 "room also a zone that suits it and uses free space")
+    composition: str = Field(description="How the zones are distributed over the room and sit relative to each other, "
+                                         "main walkways, the larger open areas and what each is for, visual balance")
 
 
 class FurnitureGap(BaseModel):
@@ -117,65 +127,12 @@ class DesignerDecision(BaseModel):
                                          "do not mention validation, renders or other workflow steps")
 
 
-SYSTEM_PROMPT = """You are an experienced interior designer. You arrange a room so the result is functional and fits the user's wishes. Bring your own taste and creativity: asymmetry and unusual compositions are welcome as long as the room stays usable.
-
-Design principles:
-- Function before style. Explicit wishes ("with a kitchen", "seating for four") are requirements; style words ("modern", "minimalist", "spacious", "cosy") guide the look, the amount of furniture and the feel of the space. They never justify removing pieces a required function needs.
-- Think in functional groups, not single pieces. Each group has an anchor (dining table, sofa, bed, desk, kitchen run) and supporting pieces arranged around it: chairs around and facing their table, sofa and armchairs facing a shared focus with a coffee table in reach, cabinets in a continuous run along a wall forming one kitchen, a lamp or side table next to the seat it serves.
-- Every piece needs a purpose and a place in a group or a deliberate standalone role (e.g. a plant balancing a corner). Avoid stray pieces in the middle of nowhere.
-- Keep what a function needs. Remove a piece only if removing is allowed and it has no role in the plan, or a better replacement takes its role.
-- Balance open space, circulation, access and looks: clear walkways between zones and to the doors, groups that read as distinct areas, no wall crammed while another stays empty without reason.
-- Never invent items, and never silently drop a wish.
-
-Missing furniture (check before every decision to finish, report in furniture_gaps):
-- Essential: an explicit wish or a core function cannot work without it (a requested kitchen without kitchen furniture, a dining area without a table). Optional: the room works, the piece would only improve it (a coffee table for an otherwise complete sofa group, a plant, a lamp). A functional, coherent room does not need every furniture category.
-- Resolve in this order: 1) a suitable piece already in the room; 2) a suitable item from the available inventory, added directly if adding is allowed; 3) if adding is allowed and research budget is left: request_furniture now. Furniture research starts without asking the user; the user still approves every download, so do not hold back for that.
-- Request research for an essential gap. For an optional gap, request it only if it clearly improves the result for this request and research is still unused; otherwise skip it.
-- Only when 1-3 are impossible (adding not allowed, no research left, or research found nothing) finish without it, and say in the explanation what is missing and why. Never finish with an offer like "I can request X if you want": the user cannot reply during the run, so either request it now or leave it.
-
-Planning (the plan field, filled before placements):
-- Before the first change of a redesign, plan: the requirements, the functional zones they need, the essential pieces and anchor of each zone, how the pieces of a zone relate, and where the zones sit in this room (use the real dimensions, walls and the pieces and inventory you actually have). Then derive placements from the plan, zone by zone, anchor first.
-- Not every room needs predefined zones; plan only what the request and the room call for.
-- Your plan is stored and shown to you in later steps. Repeat it only when you change the concept; otherwise send null.
-- For small, local requests (move or turn one piece, a minor tweak) do not replan the room: send plan null and change only what was asked, keeping the piece's relationship to its group.
-
-Coordinate system (metres):
-- The room is a rectangle centred on (0, 0). X runs from -width/2 to +width/2, Z from -depth/2 to +depth/2. Y is up; the floor is y = 0, the ceiling y = room height.
-- x and z are the centre of a piece's footprint; y is the height of its BOTTOM. A piece occupies the heights y to y + height ("top" in the layout lists).
-- At rotation_deg = 0 a piece faces +Z. Rotation is counter-clockwise seen from above: 90 faces +X, 180 faces -Z, -90 faces -X. A piece against the back wall (z = -depth/2) facing into the room uses 0; against the left wall (x = -width/2) it uses 90.
-- width is the footprint along X and depth along Z at rotation 0; at 90/-90 they swap.
-
-Vertical placement:
-- Furniture stands on the floor (y = 0) unless there is a reason for another height. Rugs lie on the floor and furniture may stand on them at y = 0.
-- Small pieces may stand on a suitable larger one: y = that piece's top, centre over its footprint (TV on a sideboard or counter, lamp or decor on a table or shelf). Only put light, smaller things on top of sturdier, larger ones.
-- Wall pieces (pictures, mirrors, dartboards, wall shelves, wall cabinets, wall-mounted TVs) touch a wall that exists and hang at a sensible height (pictures around eye level, wall cabinets well above the worktop). Never mount on a side without a wall. Their back touches the wall, so the centre sits half their depth in front of it: on the back wall z = -depth_room/2 + depth/2 with rotation 0, on the left wall x = -width_room/2 + depth/2 with rotation 90 (depth = the piece's depth). A centre exactly on the wall line sticks half into the wall.
-- Nothing floats: a piece above the floor either stands on another piece or is mounted on a wall. Use height on purpose, not arbitrarily.
-
-Hard constraints:
-- Only use the piece ids of the working layout and the item_ids of the available inventory. Never invent furniture.
-- Every piece must stay completely inside the room (also below the ceiling). Pieces must not intersect: footprints may only overlap where the height ranges do not (rug below, object on top, wall piece above). Furniture against a wall should touch it closely.
-- Keep walkways of roughly 0.6 m and keep the fronts of cabinets, shelves and seats accessible.
-- Respect the permissions below: add pieces only if adding is allowed; remove pieces that were in the room before only if removing is allowed. Pieces you added yourself (ids starting with "new-") may always be removed again. The same inventory item may be placed more than once.
-
-Screenshots (when attached) show the layout version stated next to them: a top-down view (image up = back wall, image right = +x, 1 m grid, numbered markers = the "marker" numbers of the layout shown: the room list for v0, your working layout list otherwise; a piece on top of another covers it there, and markers of stacked pieces are drawn next to each other) and a perspective view from the front right. Use them for arrangement, groups, orientation, colours, materials and visual balance; use the structured numbers for exact geometry. Never add furniture you think you see in an image. When they show an older version than your working layout, the section "Screenshots vs. working layout" lists what has changed since. You cannot request screenshots: after a validation that passes, they are refreshed automatically when the layout changed substantially (pieces added or removed, several moved or turned) or the screenshots are a few versions old. Invalid layouts are not rendered; repair them from the numbers.
-
-You work in steps. In each step you may move pieces (placements; pieces you leave out keep their position), add pieces (add) and remove pieces (remove), and choose next_action:
-- validate: a deterministic check of boundaries, 3D collisions and support (no floating pieces); it may correct small errors. Set finish_when_valid=true when you are done as soon as it passes (usual case); you then get no further step, so do the completeness check first.
-- request_critique: independent feedback from the interior critic on your working layout, useful once for bigger redesigns. When a final review is enabled and no critique happened yet, the critic reviews your validated layout automatically when you finish, and you get one more step to act on it.
-- request_furniture: ask the furniture research agent for ONE missing piece per request (fill furniture_request with what it is for, size limits that fit the free space, style, colours). Possible when adding is allowed and research budget is left. You may place and arrange the rest of the room in the same step. Afterwards you get the next step: found or downloaded items then appear in the available inventory; place them and validate.
-- finish: done. Only possible when your latest layout passed validation, or when no change is needed.
-Respect the remaining budget given below and avoid repeating requests without a reason.
-
-Repairing validation errors (when the latest validation lists unresolved errors):
-- Read every error first. Each names the pieces by id, the overlap or violation in metres, its severity and repair options: moves of single pieces with direction, distance, target position and what that move alone would cause ("clear" or e.g. "hits 'Sofa'"). Options are geometric suggestions, not guaranteed solutions; you may use one, combine them or do something else.
-- Move far enough. A move shorter than the stated overlap cannot resolve it; nudging a piece by a few centimetres against a 0.3 m overlap only wastes a step. Prefer an option marked clear; when moving one piece would hit another, move the other one too or choose a different direction.
-- Choose the strategy by the situation (repair_strategy): shift for single small to medium overlaps with a clear option; rotate when a piece fits in its place only turned; relocate when its spot is too tight; regroup when several pieces of one group collide (e.g. chairs crowding a table): rearrange the whole group, usually with more space or fewer seats, possibly elsewhere in the room; remove only an optional piece in an overcrowded room and only if removing is allowed (pieces you added yourself may always go). Never remove a piece an explicit wish or a core function needs just to pass validation.
-- Substantial changes are allowed whenever local corrections cannot produce a functional arrangement; keep the relationships and requirements of your plan.
-- The repair progress section shows whether your previous attempts improved the layout. Never repeat an attempt that did not help; escalate (shift -> rotate/relocate -> regroup -> remove an optional piece)."""
+SYSTEM_PROMPT = load_prompt("interior_designer_system")
 
 
 def options(state: DesignState) -> dict:
-    return {"allow_new_furniture": False, "allow_removal": False, "final_review": False, **(state.get("options") or {})}
+    return {"allow_new_furniture": False, "allow_removal": False, "final_review": False, "search_online": True,
+            "review_suggestions": True, **(state.get("options") or {})}
 
 
 def available_items() -> dict[str, dict]:
@@ -339,8 +296,14 @@ def _critique_text(state: DesignState) -> str | None:
     if not critique:
         return None
     lines = [f"Critique of layout v{state.get('critiqued_layout_version')}: {critique.get('summary', '')}"]
-    lines += [f"- issue ({i['severity']}): {i['description']}" for i in critique.get("issues", [])]
+    if scores := critique.get("scores"):
+        lines.append("Scores (1-5): " + ", ".join(f"{name} {value}" for name, value in scores.items()))
+    lines += [f"- issue ({', '.join(filter(None, (i['severity'], i.get('aspect'))))}): {i['description']}"
+              for i in critique.get("issues", [])]
     lines += [f"- suggestion: {s}" for s in critique.get("suggestions", [])]
+    if state.get("critic_research_bonus"):
+        lines.append("Extra furniture research was granted for this critique: use it for pieces that resolve one of "
+                     "its concrete points and that the inventory does not have.")
     reviewed = state.get("reviewed_layout")
     if reviewed and state.get("critiqued_layout_version") == reviewed["layout_version"]:
         v = reviewed["layout_version"]
@@ -348,19 +311,42 @@ def _critique_text(state: DesignState) -> str | None:
             f"This is the final review of your validated layout v{v}, requested automatically when you finished. "
             "Weigh its points against the request: apply the improvements that clearly make the room better (then "
             "validate with finish_when_valid=true), or finish if the layout already serves the request well. "
+            "For points that need furniture the inventory lacks, request_furniture is an option while furniture "
+            "research is available (see below); place the found pieces in the following step. "
             f"There is no further critique. If your changes cannot be validated within the remaining budget, "
             f"layout v{v} is kept.")
     return "\n".join(lines)
 
 
+def _research_item_text(entry: dict) -> str:
+    ids = lambda items: ", ".join(f"{i['name']} (item_id {i['itemId']})" for i in items)
+    status = entry["status"]
+    if status == "found_locally":
+        text = f"already in the inventory: {ids(entry['local'])}"
+    elif status in ("completed", "failed"):
+        parts = []
+        if entry["added"]:
+            parts.append(("chosen automatically and downloaded: " if entry.get("auto") else "found online and downloaded: ")
+                         + ids(entry["added"]))
+        if entry["existing"]:
+            parts.append(f"already in the inventory: {ids(entry['existing'])}")
+        if entry["failed"]:
+            parts.append("download failed: " + ", ".join(f["name"] for f in entry["failed"]))
+        text = "; ".join(parts) or (entry.get("note") or "failed")
+    else:
+        text = {"skipped": "skipped by the user (do not request it again)",
+                "rejected": f"all suggestions rejected by the user after {entry['runs']} search runs (do not request it again)",
+                "not_found": f"not found ({entry.get('note') or 'nothing suitable'})"}.get(status, status)
+    return f"- {entry['description']}{' [essential]' if entry.get('essential') else ''}: {text}"
+
+
 def _research_text(state: DesignState) -> str | None:
     result = state.get("research_result")
-    if not result or not state.get("furniture_request"):
+    if not result or not result.get("items") or not state.get("furniture_request"):
         return None
-    added = ", ".join(f"{a['name']} (item_id {a['itemId']})" for a in result.get("added", [])) or "none"
-    local = ", ".join(f"{c['name']} (item_id {c['itemId']})" for c in result.get("local", [])) or "none"
-    return (f"Furniture research for '{state['furniture_request'].get('description')}': {result.get('status')}. "
-            f"Suitable items already in the inventory: {local}. Newly downloaded: {added}. {result.get('summary', '')}")
+    lines = ["Result of your latest furniture list (place the available pieces now, all in this step):"]
+    lines += [_research_item_text(entry) for entry in result["items"]]
+    return "\n".join(lines)
 
 
 def plan_notes(plan: dict, pieces: list[Furniture], items: dict[str, dict]) -> list[str]:
@@ -423,6 +409,8 @@ def research_blocker(state: DesignState) -> str | None:
     count the current designer step: a step has to be left to place what research brings back."""
     if not options(state)["allow_new_furniture"]:
         return "adding furniture is not allowed"
+    if not options(state)["search_online"]:
+        return "online furniture search is switched off; use the inventory"
     if remaining(state, "research_requests") <= 0:
         return "furniture research limit reached"
     if remaining(state, "designer_steps") <= 0:
@@ -435,8 +423,9 @@ def _research_availability(state: DesignState) -> str:
     blocker = research_blocker({**state, "counters": add_counts(state.get("counters"), {"designer_steps": 1})})
     if blocker:
         return f"Furniture research: NOT available ({blocker})."
-    return ("Furniture research: AVAILABLE. Use request_furniture for an important missing piece; it starts without "
-            "asking the user, who approves downloads later.")
+    lists = remaining(state, "research_requests")
+    return (f"Furniture research: AVAILABLE for {lists} more list(s) of up to {MAX_ITEMS_PER_REQUEST} pieces each. "
+            "Use request_furniture with one list of all missing pieces; it starts without asking the user.")
 
 
 def build_messages(state: DesignState, images: list[tuple[str, str]] | None = None,
@@ -618,26 +607,44 @@ def _conclude(state: DesignState, note: str) -> dict:
     return final_review(state) or _finish(state, note)
 
 
-def _start_research(request: dict) -> dict:
-    # Fresh research context; the previous search (if any) is finished.
-    return {"designer_action": "request_furniture", "furniture_request": {**request, "origin": "interior_designer"},
-            "return_to": {"furniture_research": "interior_designer"}, "counters": {"research_requests": 1},
-            "researched": [request["description"]],
-            "research_round": 0, "candidates": [], "approval": None, "download_result": None, "research_result": {},
-            "research_status": "", "local_candidates": [], "local_assessment": ""}
+def _start_research(items: list[dict], shared: dict | None = None) -> dict:
+    """A fresh furniture list; the previous list (if any) is finished. The research counts the
+    budget itself once the list really goes online (research_requests)."""
+    return {"designer_action": "request_furniture",
+            "furniture_request": {"items": items, **(shared or {}), "origin": "interior_designer"},
+            "return_to": {"furniture_research": "interior_designer"},
+            "researched": [item["description"] for item in items],
+            "research_items": [], "research_status": "", "research_result": {}, "approval": None,
+            "approval_item": None, "download_result": None}
 
 
 def _was_researched(state: DesignState, item: str) -> bool:
     return any(item.strip().lower() in done.lower() for done in state.get("researched") or [])
 
 
-def _unresearched_essential(state: DesignState, decision: DesignerDecision) -> FurnitureGap | None:
-    """An essential gap the designer wants to finish with although research could still close it.
-    Gaps that were already researched in this run are not searched again (one request per gap)."""
+def _gap_item(gap: FurnitureGap) -> dict:
+    return {"description": f"{gap.item} ({gap.reason})", "purpose": gap.reason, "size": None, "style": None,
+            "colors_materials": None, "essential": True}
+
+
+def _unresearched_essential(state: DesignState, decision: DesignerDecision) -> list[FurnitureGap]:
+    """Essential gaps that research could still close: gaps the designer wants to finish with, and
+    gaps missing from its own list. Gaps researched before in this run (also skipped or rejected
+    ones) are never searched again automatically. Only while research is possible (online search on)."""
     finishing = decision.next_action == "finish" or (decision.next_action == "validate" and decision.finish_when_valid)
-    if not finishing or research_blocker(state) is not None:
-        return None
-    return next((g for g in decision.furniture_gaps if g.essential and not _was_researched(state, g.item)), None)
+    if not (finishing or decision.next_action == "request_furniture") or research_blocker(state) is not None:
+        return []
+    return [g for g in decision.furniture_gaps if g.essential and not _was_researched(state, g.item)]
+
+
+def _research_list(decision: DesignerDecision, gaps: list[FurnitureGap]) -> tuple[list[dict], dict]:
+    """The designer's own list plus the essential gaps it does not cover, essential pieces first."""
+    request = decision.furniture_request
+    items = [i.model_dump() for i in request.items] if request else []
+    covered = lambda gap: any(gap.item.strip().lower() in i["description"].lower() for i in items)
+    items += [_gap_item(g) for g in gaps if not covered(g)]
+    shared = {"style": request.style, "budget": request.budget} if request else {}
+    return sorted(items, key=lambda i: not i["essential"]), shared
 
 
 def guard_action(state: DesignState, decision: DesignerDecision) -> tuple[dict, str | None]:
@@ -645,12 +652,10 @@ def guard_action(state: DesignState, decision: DesignerDecision) -> tuple[dict, 
     layout change. Returns (state update, note if the decision was overridden)."""
     action = decision.next_action
     version = current_version(state)
-    if gap := _unresearched_essential(state, decision):
-        request = {"description": f"{gap.item} ({gap.reason})", "style": None, "size": None,
-                   "colors_materials": None, "budget": None}
-        if decision.furniture_request and gap.item.lower() in decision.furniture_request.description.lower():
-            request = decision.furniture_request.model_dump()  # the designer's own, more detailed request
-        return _start_research(request), f"essential furniture missing: {gap.item}"
+    gaps = _unresearched_essential(state, decision)
+    if gaps and action != "request_furniture":
+        items, shared = _research_list(decision, gaps)
+        return _start_research(items, shared), f"essential furniture missing: {', '.join(g.item for g in gaps)}"
     if action == "validate":
         if not has_proposal(state):
             return _finish(state, "nothing to validate"), "validate without a layout"
@@ -666,9 +671,11 @@ def guard_action(state: DesignState, decision: DesignerDecision) -> tuple[dict, 
     if action == "request_furniture":
         if blocker := research_blocker(state):
             return _safe_fallback(state, blocker)
-        if decision.furniture_request is None:
-            return _safe_fallback(state, "furniture request without details")
-        return _start_research(decision.furniture_request.model_dump()), None
+        items, shared = _research_list(decision, gaps)
+        if not items:
+            return _safe_fallback(state, "furniture request without items")
+        merged = [g.item for g in gaps if any(i["description"] == _gap_item(g)["description"] for i in items)]
+        return _start_research(items, shared), (f"added essential gaps to the list: {', '.join(merged)}" if merged else None)
     # finish
     if has_proposal(state) and not _validated(state):
         return _safe_fallback(state, "finish with an unvalidated layout")

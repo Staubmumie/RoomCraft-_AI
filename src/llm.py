@@ -1,5 +1,6 @@
 """OpenRouter access through the OpenAI SDK. Agents only call `structured_completion`."""
 import asyncio
+import json
 import os
 import time
 from dataclasses import dataclass, field
@@ -9,6 +10,7 @@ from typing import Generic, TypeVar
 import httpx
 import openai
 from openai import AsyncOpenAI
+from openai.lib._parsing._completions import type_to_response_format_param
 from pydantic import BaseModel, ValidationError
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -20,7 +22,7 @@ AGENT_MODELS = {
     "interior_designer": "Interior Designer",
     "interior_critic": "Interior Critic",
     "furniture_research": "Furniture Research",
-    "orchestrator": "Orchestrator",
+    "orchestrator": "Request Router",
 }
 MAX_ATTEMPTS = 2  # transient failures (timeouts, 429, 5xx) are retried once
 
@@ -155,11 +157,11 @@ async def _complete(info: CallInfo, request) -> object:
         attempt_started = time.perf_counter()
         try:
             completion = await request()
-            info.attempts.append({"attempt": attempt, "durationMs": round((time.perf_counter() - attempt_started) * 1000)})
+            info.attempts.append({"attempt": len(info.attempts) + 1, "durationMs": round((time.perf_counter() - attempt_started) * 1000)})
             break
         except Exception as exc:
             info.attempts.append({
-                "attempt": attempt,
+                "attempt": len(info.attempts) + 1,
                 "durationMs": round((time.perf_counter() - attempt_started) * 1000),
                 "error": f"{type(exc).__name__}: {exc}"[:300],
             })
@@ -198,17 +200,43 @@ async def tool_completion(model: str, messages: list[dict], tools: list[dict],
     return result, info
 
 
-async def structured_completion(model: str, messages: list[dict], schema: type[T]) -> StructuredResult[T]:
-    """Runs one chat completion whose answer must match `schema`."""
-    info = CallInfo(model=model)
-    completion = await _complete(info, lambda: get_client().chat.completions.parse(
-        model=model, messages=messages, response_format=schema, extra_body=OPENROUTER_EXTRA))
+def parse_structured(content: str, schema: type[T]) -> T:
+    """The answer as `schema`. Some models append text or repeat the object after a complete JSON
+    answer ("trailing characters"); the first complete JSON value is used then."""
+    try:
+        return schema.model_validate_json(content)
+    except ValidationError as exc:
+        try:
+            value, _ = json.JSONDecoder().raw_decode(content.strip())
+        except ValueError:
+            raise exc from None
+        return schema.model_validate(value)  # still raises if the first value does not match
 
-    message = completion.choices[0].message
-    if message.refusal:
-        info.error = f"Refusal: {message.refusal}"
-        raise LLMError(f"The model refused the request: {message.refusal}", status_code=422, info=info)
-    if message.parsed is None:
-        info.error = "No structured answer"
-        raise LLMError("The model returned no structured answer.", info=info)
-    return StructuredResult(parsed=message.parsed, info=info)
+
+async def structured_completion(model: str, messages: list[dict], schema: type[T]) -> StructuredResult[T]:
+    """Runs one chat completion whose answer must match `schema` (strict JSON schema). An answer that
+    cannot be read as `schema` is asked for once more before failing."""
+    info = CallInfo(model=model)
+    response_format = type_to_response_format_param(schema)
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        completion = await _complete(info, lambda: get_client().chat.completions.create(
+            model=model, messages=messages, response_format=response_format, extra_body=OPENROUTER_EXTRA))
+        choice = completion.choices[0]
+        message = choice.message
+        if message.refusal:
+            info.error = f"Refusal: {message.refusal}"
+            raise LLMError(f"The model refused the request: {message.refusal}", status_code=422, info=info)
+        if choice.finish_reason == "length":
+            info.error = "Answer cut off (length)"
+            raise LLMError("The model's answer was cut off before the layout was complete.", info=info)
+        if not message.content:
+            info.error = "No structured answer"
+            raise LLMError("The model returned no structured answer.", info=info)
+        try:
+            return StructuredResult(parsed=parse_structured(message.content, schema), info=info)
+        except ValidationError as exc:
+            info.attempts[-1]["error"] = f"{type(exc).__name__}: {exc}"[:300]
+            if attempt == MAX_ATTEMPTS:
+                info.error = str(_to_llm_error(exc, model))
+                raise LLMError(info.error, info=info) from exc
+    raise AssertionError("unreachable")

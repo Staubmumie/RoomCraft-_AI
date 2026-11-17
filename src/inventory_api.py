@@ -5,7 +5,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 import inventory
-from furniture.pipeline import process_asset, remove
+from furniture.pipeline import process_asset, remove, unit_scale
 
 router = APIRouter(prefix="/api/inventory", tags=["inventory"])
 MEDIA_TYPES = {".glb": "model/gltf-binary", ".gltf": "model/gltf+json"}
@@ -47,7 +47,10 @@ async def delete_from_inventory(item_id: str):
 
 @router.put("/{item_id}/dimensions")
 async def set_dimensions(item_id: str, dimensions: Dimensions):
-    return await inventory.update_item(item_id, dimensions=dimensions.model_dump())
+    """The size the browser measured when the server could not (in model units, like the pipeline's
+    measurement), with the same unit detection, so centimetre models are not used 100x too large."""
+    size = dimensions.model_dump()
+    return await inventory.update_item(item_id, dimensions=size, unitScale=unit_scale(size))
 
 
 @router.get("/{item_id}/files/{file_path:path}")

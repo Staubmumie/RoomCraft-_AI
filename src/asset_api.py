@@ -3,6 +3,8 @@ from urllib.parse import quote
 import httpx
 from fastapi import APIRouter, HTTPException
 
+from asset_rate import throttle_request
+
 router = APIRouter(prefix="/api/assets", tags=["assets"])
 
 ASSET_API = "https://3d.shep.bot"
@@ -26,7 +28,7 @@ def raise_upstream_error(exc: httpx.HTTPError, action: str):
 
 async def fetch_json(path: str, action: str, params: dict | None = None, timeout: float = 30):
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout, event_hooks={"request": [throttle_request]}) as client:
             response = await client.get(f"{ASSET_API}{path}", params=params)
             response.raise_for_status()
             return response.json()

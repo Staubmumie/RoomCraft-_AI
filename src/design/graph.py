@@ -6,18 +6,20 @@
     interior_designer  -> layout_validator | furniture_research | interior_critic | END
     layout_validator   -> render_scene (valid and substantially changed / outdated screenshots) | interior_designer
     interior_critic    -> render_scene (outdated screenshots) | interior_designer (if it asked) | END (standalone critique)
-    furniture_research -> human_approval | interior_designer (if it asked) | END (standalone search)
-    human_approval     -> approve: asset_download | reject / retry: furniture_research   (interrupt())
+    furniture_research -> human_approval (one item ready) | asset_download (downloads queued)
+                          | interior_designer (if it asked) | END (standalone search)
+    human_approval     -> approve: asset_download | reject / skip: furniture_research   (interrupt())
     asset_download     -> furniture_research (always)
 
-Routing functions and loop limits live in design.routing. human_approval pauses the run with
-interrupt(); it resumes in the same LangGraph thread with Command(resume=decision).
+Routing functions and loop limits live in design.routing. The three nodes of a furniture list
+(furniture_research, human_approval, asset_download) live in the research package. human_approval
+pauses the run with interrupt(); it resumes in the same LangGraph thread with Command(resume=decision).
+The per-item searches and downloads of a furniture list run as background jobs (research.jobs) that
+outlive such a pause; furniture_research coordinates them through the explicit state in `research_items`.
 """
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import START, StateGraph
 
-from design.asset_download import asset_download
-from design.human_approval import human_approval
 from design.interior_critic import interior_critic
 from design.interior_designer import interior_designer
 from design.layout_validator import layout_validator
@@ -26,10 +28,12 @@ from design.render_scene import render_scene
 from design.routing import FIXED_EDGES, ROUTERS
 from design.state import DesignState
 from research.agent import furniture_research
+from research.asset_download import asset_download
+from research.human_approval import human_approval
 
 NODES = {
-    "orchestrator": (orchestrator, "Orchestrator", "router",
-                     "Classifies the request (and blocks manipulation attempts)."),
+    "orchestrator": (orchestrator, "Request Router", "router",
+                     "Checks the request (blocks manipulation attempts) and routes it: design, critique, search or reject."),
     "render_scene": (render_scene, "Render Scene", "tool",
                      "Screenshots of the working layout: first look, after validated changes, for the critic."),
     "interior_designer": (interior_designer, "Interior Designer", "agent",
@@ -39,11 +43,11 @@ NODES = {
     "interior_critic": (interior_critic, "Interior Critic", "agent",
                         "Evaluates a layout and suggests improvements."),
     "furniture_research": (furniture_research, "Furniture Research", "agent",
-                           "Searches 3D furniture via MCP and shortlists candidates."),
+                           "Works through a furniture list: local check, parallel online searches per item, results."),
     "human_approval": (human_approval, "Human Approval", "human",
-                       "Waits for the user to choose which assets may be downloaded."),
+                       "Waits for the user's decision on one furniture item (approve, nothing fits, skip)."),
     "asset_download": (asset_download, "Asset Download", "tool",
-                       "Downloads the approved assets into the inventory."),
+                       "Starts background downloads of approved or automatically chosen assets."),
 }
 
 

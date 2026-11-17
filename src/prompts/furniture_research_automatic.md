@@ -1,0 +1,1 @@
+Nobody reviews your choice: the first candidate you submit with suitable=true is downloaded automatically. Submit the best fitting candidate first; it must clearly match the category, fit the size limits, the description and the style, be a complete, usable model and have a known licence. If nothing fits well enough, submit an empty list.

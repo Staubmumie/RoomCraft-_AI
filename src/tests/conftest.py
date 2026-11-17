@@ -11,8 +11,8 @@ import design.render_scene as render_scene_module
 import design.scene_images as scene_images_module
 import rendering.service as render_service
 from design.interior_critic import Critique
-from design.interior_designer import (DesignerDecision, DesignPlan, FurnitureGap, FurnitureRequest, NewPiece,
-                                      PlacementProposal)
+from design.interior_designer import (DesignerDecision, DesignPlan, FurnitureGap, FurnitureItemRequest,
+                                      FurnitureRequest, NewPiece, PlacementProposal)
 from design.orchestrator import IntentDecision
 from llm import CallInfo, StructuredResult
 from rendering.service import RenderResult
@@ -68,8 +68,12 @@ def decide(*placements, add=(), remove=(), action="validate", finish=True, reque
            explanation="test", plan=None, gaps=(), strategy="none") -> DesignerDecision:
     """One scripted designer step. `add` takes (item_id, x, z[, rotation_deg[, y]]) tuples; `plan` a DesignPlan
     dict; `gaps` (item, essential) tuples for the completeness check."""
-    furniture_request = FurnitureRequest(description=request, style=None, size=None, colors_materials=None,
-                                         budget=None) if request else None
+    # `request`: one description, or a list of descriptions / (description, essential) tuples
+    entries = [request] if isinstance(request, str) else list(request or [])
+    furniture_request = FurnitureRequest(items=[
+        FurnitureItemRequest(description=e if isinstance(e, str) else e[0], purpose=None, size=None, style=None,
+                             colors_materials=None, essential=False if isinstance(e, str) else e[1])
+        for e in entries], style=None, budget=None) if entries else None
     new = [NewPiece(item_id=a[0], x=a[1], z=a[2], rotation_deg=a[3] if len(a) > 3 else 0.0,
                     y=a[4] if len(a) > 4 else 0.0) for a in add]
     return DesignerDecision(plan=DesignPlan.model_validate(plan) if plan else None, explanation=explanation,
@@ -92,7 +96,8 @@ def critique(summary="Looks balanced.", issues=0) -> Critique:
         "summary": summary,
         "scores": {"functionality": 4, "aesthetics": 4, "space_utilization": 3, "preference_fit": 4},
         "strengths": ["Clear walkway"],
-        "issues": [{"severity": "medium", "description": f"Issue {i}", "furniture_ids": []} for i in range(issues)],
+        "issues": [{"severity": "medium", "aspect": "space_utilization", "description": f"Issue {i}", "furniture_ids": []}
+                   for i in range(issues)],
         "suggestions": ["Add a rug"],
     })
 
@@ -101,9 +106,10 @@ class FakeLLM:
     """Scripted replacement for every structured LLM call (orchestrator, designer, critic) and for
     the renderer, which stores two small PNGs."""
 
-    def __init__(self, intent: str, steps: tuple, renders_dir, suspicious=False):
+    def __init__(self, intent: str, steps: tuple, renders_dir, suspicious=False, furniture_items=()):
         self.intent = intent
         self.suspicious = suspicious
+        self.furniture_items = list(furniture_items)
         self.steps = list(steps)
         self.critiques: list[Critique] = []
         self.renders_dir = renders_dir
@@ -120,7 +126,8 @@ class FakeLLM:
         self.models_used.append((schema.__name__, model))
         if schema is IntentDecision:
             self.orchestrator_calls.append(messages)
-            parsed = IntentDecision(intent=self.intent, suspicious=self.suspicious, reason="test")
+            parsed = IntentDecision(intent=self.intent, suspicious=self.suspicious, reason="test",
+                                    furniture_items=self.furniture_items)
         elif schema is DesignerDecision:
             self.designer_calls.append(messages)
             parsed = self.steps[min(len(self.designer_calls), len(self.steps)) - 1]
@@ -155,8 +162,8 @@ def fake_llm(monkeypatch, tmp_path):
     monkeypatch.setattr(render_service, "DATA_DIR", tmp_path)
     monkeypatch.setattr(render_service, "RENDERS_DIR", tmp_path / "renders")
 
-    def install(*steps, intent="DESIGN_ROOM", suspicious=False):
-        fake = FakeLLM(intent, steps, tmp_path / "renders", suspicious)
+    def install(*steps, intent="DESIGN_ROOM", suspicious=False, furniture_items=()):
+        fake = FakeLLM(intent, steps, tmp_path / "renders", suspicious, furniture_items)
         for module in (orchestrator_module, designer_module, critic_module):
             monkeypatch.setattr(module, "structured_completion", fake.complete)
         monkeypatch.setattr(scene_images_module, "supports_image_input", fake.supports_image_input)

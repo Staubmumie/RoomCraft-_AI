@@ -3,14 +3,36 @@
 Each event carries the id of the node execution (LangGraph task id) so repeated or
 parallel executions of the same node never get mixed up. Outside a graph run
 (e.g. in tests) all calls are no-ops.
+
+Background jobs of the furniture research (research.jobs) run outside any node execution. They
+`capture` their events into a buffer; the research coordinator `replay`s them in its own execution.
 """
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar
 
 from langgraph.config import get_config, get_stream_writer
 
+_buffer: ContextVar[list | None] = ContextVar("progress_buffer", default=None)
+
+
+def capture(buffer: list) -> None:
+    """Collect this context's events in `buffer` instead of writing them to a stream."""
+    _buffer.set(buffer)
+
+
+def replay(events: list[dict]) -> None:
+    """Emit buffered events as events of the current node execution."""
+    writer, execution_id = _context()
+    if writer:
+        for event in events:
+            writer({**event, "executionId": execution_id})
+
 
 def _context():
+    buffer = _buffer.get()
+    if buffer is not None:
+        return buffer.append, None
     try:
         writer = get_stream_writer()
         namespace = get_config()["metadata"].get("langgraph_checkpoint_ns", "")

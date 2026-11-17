@@ -21,7 +21,9 @@ export function useDesignRun() {
 
   useEffect(() => close, [close]);
 
-  const start = useCallback(async (payload) => {
+  // `onDownloaded` is called whenever furniture of this run arrived in the inventory (downloads finish
+  // in the background while the run goes on), so the inventory can be reloaded right away.
+  const start = useCallback(async (payload, { onDownloaded } = {}) => {
     close();
     setEvents([]);
     setConnectionError('');
@@ -32,13 +34,7 @@ export function useDesignRun() {
 
     return new Promise((resolve, reject) => {
       let offset = null;
-      // Downloads are on the server once asset_download completed, even if the run ends without a result.
-      let downloaded = false;
-      const fail = (message) => {
-        const error = new Error(message);
-        error.downloaded = downloaded;
-        reject(error);
-      };
+      const fail = (message) => reject(new Error(message));
       // EventSource reconnects on its own and sends Last-Event-ID, so the backend only
       // replays missed events; the run itself is never started twice.
       const es = new EventSource(api.designRunEventsUrl(id));
@@ -55,8 +51,9 @@ export function useDesignRun() {
         }
         setConnectionError('');
         setEvents((list) => [...list, event]);
-        if (event.type === 'node.completed' && event.node === 'asset_download'
-          && event.payload?.output?.download_result?.added?.length) downloaded = true;
+        if (event.type === 'node.completed' && event.payload?.output?.download_result?.added?.length) {
+          onDownloaded?.();
+        }
 
         if (TERMINAL_EVENTS.has(event.type)) {
           es.close();

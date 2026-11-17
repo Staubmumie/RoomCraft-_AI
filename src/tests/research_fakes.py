@@ -4,8 +4,8 @@ import json
 
 from fastapi import HTTPException
 
-import design.asset_download as download_module
 import research.agent as agent
+import research.asset_download as download_module
 from furniture.pipeline import ProcessResult
 from llm import CallInfo
 from research.mcp_client import AssetMCPError
@@ -26,7 +26,20 @@ CATALOG = {
                              "license": "CC0", "thumbnail": "https://cdn.example.com/black.png", "downloadable": True},
     "polyfork:pine_cabinet": {"type": "model", "title": "Pine Cabinet", "source": "polyfork", "formats": ["glb"],
                               "license": "Royalty Free", "downloadable": True},
+    # further list items for the parallel tests
+    **{f"polyhaven:{name.lower().replace(' ', '_')}": {"type": "model", "title": name, "source": "polyhaven",
+                                                        "formats": ["glb"], "license": "CC0", "downloadable": True}
+       for name in ("Grey Sofa", "Green Sofa", "Corner Sofa", "Floor Lamp", "Arc Lamp", "Wool Rug", "Jute Rug",
+                    "Side Table", "Glass Side Table", "Bookshelf", "Wall Shelf", "Desk Lamp")},
 }
+OK_CHECKS = {"category": "ok", "size": "ok", "style": "ok", "quality": "ok", "license": "ok"}
+
+
+def found(query, *asset_ids, summary="Found.", checks=OK_CHECKS, suitable=True):
+    """The two turns of an online run: one search, then submit `asset_ids` (ranked)."""
+    return [[call("search_assets", query=query)],
+            [call("submit_candidates", summary=summary, interpretation=f"Looking for {query}.", candidates=[
+                {"asset_id": a, "reason": "Fits.", "suitable": suitable, "checks": checks} for a in asset_ids])]]
 
 
 class FakeMCP:
@@ -70,16 +83,41 @@ def call(name, **arguments):
 call.counter = 0
 
 
-class ScriptedAgent:
-    """Plays a list of assistant turns; each turn is a list of tool calls."""
+def item_line(messages) -> str:
+    """The 'Item n of the furniture list: {...}' line of a research prompt."""
+    content = messages[1]["content"]
+    return next((line for line in content.splitlines() if "of the furniture list" in line), content)
 
-    def __init__(self, *turns):
+
+class ScriptedAgent:
+    """Plays assistant turns; each turn is a list of tool calls. `turns` are shared by all calls in
+    order; `by_item` maps a word of an item's description to that item's own turns (list items are
+    searched in parallel, so their calls interleave). `hold[word]` (an asyncio.Event) delays that
+    item's calls until it is set. Without turns left the agent finishes with an empty result."""
+
+    def __init__(self, *turns, by_item=None):
         self.turns = list(turns)
+        self.by_item = {word: list(t) for word, t in (by_item or {}).items()}
+        self.hold: dict = {}
         self.requests: list[list[dict]] = []
+        self.calls_by_item: dict[str, int] = {}
 
     async def __call__(self, model, messages, tools, tool_choice="auto"):
         self.requests.append(json.loads(json.dumps(messages)))  # snapshot
-        calls = self.turns.pop(0)
+        line = item_line(messages).lower()
+        word = next((w for w in self.by_item if w in line), None) or next((w for w in self.hold if w in line), None)
+        if word:
+            self.calls_by_item[word] = self.calls_by_item.get(word, 0) + 1
+            if word in self.hold:
+                await self.hold[word].wait()
+        queue = self.by_item.get(word) if word in self.by_item else self.turns
+        names = [t["function"]["name"] for t in tools]
+        if queue:
+            calls = queue.pop(0)
+        elif "choose_local_item" in names:
+            calls = [call("choose_local_item", item_id=None, requirements=[], reason="Nothing local fits.")]
+        else:
+            calls = [call("submit_candidates", summary="Nothing more.", candidates=[])]
         return {"role": "assistant", "content": "", "tool_calls": calls}, CallInfo(model=model)
 
 
@@ -109,14 +147,16 @@ ROUND_3 = [
 ]
 
 
-def install_research(monkeypatch, *turns):
-    """Installs fakes for MCP, LLM tool calls, previews and downloads; returns a namespace of recorders."""
+def install_research(monkeypatch, *turns, by_item=None):
+    """Installs fakes for MCP, LLM tool calls, previews and downloads; returns a namespace of recorders.
+    `ns.download_hold[asset_id]` (an asyncio.Event) keeps that download running until it is set."""
     FakeMCP.instances, FakeMCP.fail_on_connect, FakeMCP.fail_search = [], False, False
     ns = type("Recorders", (), {})()
-    ns.agent = ScriptedAgent(*(turns or (*ROUND_1, *ROUND_2, *ROUND_3)))
+    ns.agent = ScriptedAgent(*(turns or (() if by_item else (*ROUND_1, *ROUND_2, *ROUND_3))), by_item=by_item)
     ns.previews, ns.downloads, ns.updates = [], [], []
     ns.vision = True
     ns.download_errors = {}
+    ns.download_hold = {}
 
     async def fake_preview(url):
         ns.previews.append(url)
@@ -129,6 +169,8 @@ def install_research(monkeypatch, *turns):
         """Stands in for furniture.pipeline.process_asset (tested on its own in test_furniture_db.py)."""
         ns.downloads.append(asset_id)
         ns.updates.append((asset_id, extra))
+        if asset_id in ns.download_hold:
+            await ns.download_hold[asset_id].wait()
         if asset_id in ns.download_errors:
             raise HTTPException(422, ns.download_errors[asset_id])
         item_id = asset_id.replace(":", "-")

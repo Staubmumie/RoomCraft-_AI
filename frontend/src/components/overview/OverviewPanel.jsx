@@ -2,17 +2,27 @@ import { useEffect, useMemo, useState } from 'react';
 import { api } from '../../api.js';
 import { useNow } from '../../observability/useNow.js';
 import {
-  activeDuration, formatCost, formatDuration, formatTime, formatTokens, liveDuration, STATUS_LABELS, waitingDuration
+  activeDuration, formatCost, formatDuration, formatTime, formatTokens, groupTimeline, liveDuration, STATUS_LABELS,
+  waitingDuration
 } from '../../observability/runState.js';
 import WorkflowGraph from './WorkflowGraph.jsx';
 import ExecutionInspector from './ExecutionInspector.jsx';
-import ApprovalPanel from './ApprovalPanel.jsx';
+import ApprovalPanel, { PROGRESS_LABELS } from './ApprovalPanel.jsx';
 
 export default function OverviewPanel({ designRun }) {
   const { run, runId, clockOffset, connectionError, respond, cancel, cancelling, active } = designRun;
   const [graph, setGraph] = useState(null);
   const [graphError, setGraphError] = useState('');
   const [selectedId, setSelectedId] = useState(null);
+  const [expanded, setExpanded] = useState(() => new Set());  // ids of opened furniture-list groups
+  const [graphOpen, setGraphOpen] = useState(false);
+
+  useEffect(() => {
+    if (!graphOpen) return undefined;
+    const onKey = (e) => { if (e.key === 'Escape') setGraphOpen(false); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [graphOpen]);
   const now = useNow(run.status === 'running' || run.status === 'waiting');
 
   useEffect(() => {
@@ -20,7 +30,7 @@ export default function OverviewPanel({ designRun }) {
   }, []);
 
   // A new run starts with "follow the latest execution" again.
-  useEffect(() => setSelectedId(null), [runId]);
+  useEffect(() => { setSelectedId(null); setExpanded(new Set()); }, [runId]);
 
   const labels = useMemo(() => new Map((graph?.nodes ?? []).map((n) => [n.id, n.label])), [graph]);
   const selected = run.executions.find((e) => e.executionId === selectedId) ?? run.executions.at(-1) ?? null;
@@ -53,11 +63,49 @@ export default function OverviewPanel({ designRun }) {
     if (latest) setSelectedId(latest.executionId);
   };
 
+  const timeline = groupTimeline(run.executions);
+  const toggleGroup = (id) => setExpanded((current) => {
+    const next = new Set(current);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  });
+  const usageLine = (u) => u.calls > 0 && (
+    <span className="timeline-usage mono muted small">
+      {formatTokens(u.totalTokens)} tokens{u.hasCost ? ` · ${formatCost(u.cost)}` : ''}
+    </span>
+  );
+  const entry = (ex) => {
+    const wait = waitingDuration(ex, now, clockOffset);
+    return (
+      <button className={`timeline-entry status-${ex.status} ${selected?.executionId === ex.executionId ? 'selected' : ''}`}
+        onClick={() => setSelectedId(ex.executionId)}>
+        <span className="order">{ex.order}</span>
+        <span className="status-dot" />
+        <span className="timeline-name">{labels.get(ex.node) ?? ex.node}</span>
+        <span className="mono muted small">{formatTime(ex.startedAt)}</span>
+        <span className="mono small">{formatDuration(activeDuration(ex, now, clockOffset))}</span>
+        {ex.status === 'waiting' && <span className="timeline-usage small status-text status-waiting">Waiting for selection · {formatDuration(wait)}</span>}
+        {ex.status !== 'waiting' && wait > 0 && <span className="timeline-usage mono muted small">Waited {formatDuration(wait)}</span>}
+        {ex.summary && <span className="timeline-usage small">{ex.summary}</span>}
+        {usageLine(ex.usage)}
+      </button>
+    );
+  };
+
   return (
     <div className="panel overview">
       {run.status === 'waiting' && run.approval && (
-        <ApprovalPanel key={`${runId}:${run.approval.round}`} approval={run.approval} onRespond={respond}
-          onAbort={cancel} aborting={cancelling} />
+        <ApprovalPanel key={`${runId}:${run.approval.itemKey}:${run.approval.run}`} approval={run.approval}
+          onRespond={respond} onAbort={cancel} aborting={cancelling} />
+      )}
+      {run.status === 'running' && run.research && run.research.total > 0 && (
+        // No item is ready for approval right now, but searches or downloads are still running.
+        <p className="small research-progress">
+          <span className="spinner" /> Furniture list ({run.research.total} item{run.research.total === 1 ? '' : 's'}):
+          {Object.entries(run.research.counts || {}).map(([status, n]) => (
+            <span key={status} className="badge">{n} {PROGRESS_LABELS[status] ?? status.replaceAll('_', ' ')}</span>
+          ))}
+        </p>
       )}
       {active && (
         <div className="abort-bar">
@@ -127,38 +175,60 @@ export default function OverviewPanel({ designRun }) {
       </section>
 
       <section>
-        <h3 className="section-title">Workflow</h3>
+        <div className="section-head">
+          <h3 className="section-title">Workflow</h3>
+          {graph && <button type="button" className="link small" onClick={() => setGraphOpen(true)}>⤢ Enlarge</button>}
+        </div>
         {graphError && <p className="error small">{graphError}</p>}
         {graph && (
           <WorkflowGraph graph={graph} nodeStates={nodeStates} runStatus={run.status}
             highlightedNode={selected?.node} onNodeClick={selectNode} />
         )}
       </section>
+      {graph && graphOpen && (
+        <div className="graph-modal" role="dialog" aria-label="Workflow graph" onClick={() => setGraphOpen(false)}>
+          <div className="graph-modal-box" onClick={(e) => e.stopPropagation()}>
+            <div className="section-head">
+              <h3 className="section-title">Workflow · {STATUS_LABELS[run.status]}</h3>
+              <span className="muted small">Dashed = decided at runtime · click a node for its details</span>
+              <button type="button" className="icon-button" onClick={() => setGraphOpen(false)} aria-label="Close">×</button>
+            </div>
+            <WorkflowGraph graph={graph} nodeStates={nodeStates} runStatus={run.status} large
+              highlightedNode={selected?.node} onNodeClick={(id) => { selectNode(id); setGraphOpen(false); }} />
+          </div>
+        </div>
+      )}
 
       <section>
         <h3 className="section-title">Timeline</h3>
         {run.executions.length === 0 && <p className="muted small">No executions yet.</p>}
         <ol className="timeline">
-          {run.executions.map((ex) => {
-            const wait = waitingDuration(ex, now, clockOffset);
+          {timeline.map((row) => {
+            if (!row.executions) return <li key={row.executionId}>{entry(row)}</li>;
+            // One furniture list: research, downloads and approvals alternate, shown as one collapsible row.
+            const open = expanded.has(row.id) || row.status === 'waiting';
+            const wait = row.executions.reduce((sum, e) => sum + waitingDuration(e, now, clockOffset), 0);
+            const containsSelected = row.executions.some((e) => e.executionId === selected?.executionId);
             return (
-              <li key={ex.executionId}>
-                <button className={`timeline-entry status-${ex.status} ${selected?.executionId === ex.executionId ? 'selected' : ''}`}
-                  onClick={() => setSelectedId(ex.executionId)}>
-                  <span className="order">{ex.order}</span>
+              <li key={row.id}>
+                <button className={`timeline-entry timeline-group status-${row.status} ${containsSelected && !open ? 'selected' : ''}`}
+                  aria-expanded={open}
+                  onClick={() => { toggleGroup(row.id); setSelectedId(row.executions.at(-1).executionId); }}>
+                  <span className="order">{open ? '▾' : '▸'}</span>
                   <span className="status-dot" />
-                  <span className="timeline-name">{labels.get(ex.node) ?? ex.node}</span>
-                  <span className="mono muted small">{formatTime(ex.startedAt)}</span>
-                  <span className="mono small">{formatDuration(activeDuration(ex, now, clockOffset))}</span>
-                  {ex.status === 'waiting' && <span className="timeline-usage small status-text status-waiting">Waiting for selection · {formatDuration(wait)}</span>}
-                  {ex.status !== 'waiting' && wait > 0 && <span className="timeline-usage mono muted small">Waited {formatDuration(wait)}</span>}
-                  {ex.summary && <span className="timeline-usage small">{ex.summary}</span>}
-                  {ex.usage.calls > 0 && (
-                    <span className="timeline-usage mono muted small">
-                      {formatTokens(ex.usage.totalTokens)} tokens{ex.usage.hasCost ? ` · ${formatCost(ex.usage.cost)}` : ''}
-                    </span>
-                  )}
+                  <span className="timeline-name">Furniture list · {row.executions.length} steps</span>
+                  <span className="mono muted small">{formatTime(row.startedAt)}</span>
+                  <span className="mono small">{formatDuration(liveDuration(row.startedAt, row.endedAt, null, now, clockOffset))}</span>
+                  {row.status === 'waiting' && <span className="timeline-usage small status-text status-waiting">Waiting for selection · {formatDuration(wait)}</span>}
+                  {row.status !== 'waiting' && wait > 0 && <span className="timeline-usage mono muted small">Waited {formatDuration(wait)}</span>}
+                  {row.summary && <span className="timeline-usage small">{row.summary}</span>}
+                  {usageLine(row.usage)}
                 </button>
+                {open && (
+                  <ol className="timeline timeline-children">
+                    {row.executions.map((ex) => <li key={ex.executionId}>{entry(ex)}</li>)}
+                  </ol>
+                )}
               </li>
             );
           })}

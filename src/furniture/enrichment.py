@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from furniture.store import CATEGORIES, category_of
 from llm import DEFAULT_MODEL, LLMError, structured_completion, supports_image_input
+from prompts import load_prompt
 
 ENRICHMENT_MODEL = os.environ.get("ENRICHMENT_MODEL", DEFAULT_MODEL)
 MAX_IMAGE_BYTES = 3 * 1024 * 1024
@@ -34,12 +35,7 @@ class FurnitureEnrichment(BaseModel):
     matches_metadata: bool = Field(description="False if the image clearly shows something other than the metadata says")
 
 
-SYSTEM_PROMPT = f"""You catalogue 3D furniture models so they can be found by search. Describe the piece factually.
-
-- Choose the category from: {', '.join(CATEGORIES)}.
-- Use the preview image (if attached) for visible properties only: type, style, colours, apparent materials, shape and design.
-- Never state measurements, prices, brands or anything you cannot see or read in the metadata. Say 'wood-look' rather than guessing a wood species.
-- Keep the description short and concrete; write in English."""
+SYSTEM_PROMPT = load_prompt("furniture_enrichment_system", categories=", ".join(CATEGORIES))
 
 
 @dataclass

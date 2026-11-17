@@ -1,122 +1,194 @@
-# RoomCraft_AI
+# RoomCraft AI
 
-3D room planner (React Three Fiber) with an AI agent workflow (LangGraph): asset search via
-[3d.shep.bot](https://3d.shep.bot), a local furniture inventory, AI layout design, critique and
-furniture research with human approval.
+An AI-assisted 3D room planner. You furnish a room in the browser with real, freely licensed 3D
+models, and a team of AI agents can redesign it for you: they plan the layout, place the furniture,
+check it for collisions, look at rendered screenshots, critique the result and, when furniture is
+missing, search the web for suitable models and download them, with your approval.
 
-## Running
+The project combines an interactive **React Three Fiber** scene with a multi-agent workflow built on
+**LangGraph** and **FastAPI**. LLMs are accessed through **OpenRouter**, so every agent can use a
+different model.
 
-Backend (FastAPI, port 8000). The agents need `OPENROUTER_API_KEY`
-(optionally `OPENROUTER_MODEL` for another default model):
+## Features
+
+### Interactive 3D room planner
+
+- Search free 3D models from [3d.shep.bot](https://3d.shep.bot) and add them to a personal inventory.
+- Place, move and rotate furniture in the room with a gizmo (`R` rotates by 45°, `Del` removes,
+  `Esc` cancels), and search the inventory by name, description or tags.
+- Every downloaded model is measured automatically (with unit detection, so centimetre models get
+  the right size) and the layout is saved in the browser.
+
+### AI room design
+
+Describe what you want in plain language, and the **Interior Designer** agent turns it into a layout.
+It first writes a functional plan (requirements, zones such as "dining" or "sofa corner", anchor
+pieces, walkways) and then places the furniture zone by zone.
+
+Every proposal goes through a **deterministic layout validator** that checks room boundaries, 3D
+collisions and support (nothing floats; a lamp may stand on a table, a picture must hang on a wall).
+It fixes small errors itself and returns the rest to the designer with concrete repair options.
+Only validated layouts are applied to your room, and "Previous layout" undoes the change.
+
+The designer also sees **rendered screenshots** of its layout (top-down and perspective), produced
+by a headless browser from the same scene components the app uses.
+
+> Make my living room cozy and add a reading corner by the window.
+
+### Design critique
+
+The **Interior Critic** evaluates a room on functionality, aesthetics, use of space and fit to your
+request, with scores, concrete issues and suggestions. You can ask for a critique of your own room,
+or let the critic review the designer's layout before a run finishes (the designer then decides
+which points to act on).
+
+> Critique my room. Is the space used well?
+
+### Furniture research with human approval
+
+When the room needs furniture that is not in your inventory, the **Furniture Research** agent works
+through a list of missing pieces in parallel. It searches the asset server over **MCP**, inspects
+metadata and preview images, and proposes up to four candidates per piece.
+
+The run then **pauses for your decision**, one item at a time: download a selection, ask for a second
+search with feedback ("darker wood", "smaller"), or skip. Downloads start right away in the
+background while you review the next item. In automatic mode, the best candidate that passes a
+deterministic check is downloaded without asking.
+
+Direct searches first check your own furniture database (semantic search in **LanceDB**) and only
+go online when nothing you already have fits.
+
+> Find a grey sofa and two floor lamps.
+
+### Furniture database
+
+Every downloaded model passes one pipeline: download, measure, describe with a vision LLM (category,
+style, colours, materials) and index with embeddings in LanceDB. The agents use it to find what you
+already own. Details: [docs/furniture-db.md](docs/furniture-db.md).
+
+### Live workflow view
+
+The **Overview** tab shows every run as it happens, streamed via Server-Sent Events: the agent graph
+with the active node, a timeline, timers, LLM calls with model and token usage, tool calls, validation
+results, screenshots and the furniture list. Runs can be aborted at any time; nothing of an aborted
+run is applied.
+
+## How the agents work together
+
+Simplified flow (the full graph is in [docs/graph.md](docs/graph.md)):
+
+```
+request ─► Request Router ─┬─► Interior Designer ◄──► Layout Validator
+                           │        │   ▲      ▲
+                           │        │   │      └──► Render Scene (screenshots)
+                           │        ▼   │
+                           │   Interior Critic
+                           │        │
+                           ├────────┴─► Furniture Research ◄──► Human Approval / Asset Download
+                           └─► Interior Critic (standalone critique)
+```
+
+- **Request Router** classifies a request as design, critique, furniture search or reject. Off-topic
+  requests and manipulation attempts are rejected; an injection filter runs before the LLM.
+- **Interior Designer** proposes layouts step by step and decides what happens next: validate,
+  request furniture, request a critique, or finish.
+- **Layout Validator** (no LLM) checks and corrects the geometry.
+- **Render Scene** produces screenshots whenever the layout changed substantially.
+- **Interior Critic** gives feedback but never changes the layout.
+- **Furniture Research**, **Human Approval** and **Asset Download** handle furniture lists.
+
+The LLM decides *what* to do; deterministic guards decide what is *allowed*. Permissions (adding or
+removing furniture, online search, automatic downloads) come from your settings, every loop has a
+budget, and a run can never finish with an unvalidated layout.
+
+The exact graph, state and routing rules are in [docs/graph.md](docs/graph.md).
+
+## Tech stack
+
+| Area | Technology |
+|---|---|
+| Frontend | React, Vite, React Three Fiber / drei |
+| Backend | Python 3.12, FastAPI, LangGraph (interrupts, checkpointer) |
+| LLMs | OpenRouter via the OpenAI SDK, structured output and tool calling |
+| Furniture search | 3d.shep.bot REST API and MCP server |
+| Furniture database | LanceDB with OpenRouter embeddings |
+| Rendering | Playwright (headless Chromium) rendering the app's own scene components |
+| Tests | pytest (LLM, MCP and downloads are faked) |
+
+## Getting started
+
+Requirements: Python 3.12 with [uv](https://docs.astral.sh/uv/), Node.js, and an
+[OpenRouter](https://openrouter.ai) API key.
+
+**Backend** (port 8000):
 
 ```powershell
 cd src
 uv sync
+uv run playwright install chromium   # renderer; Edge or Chrome also work
+$env:OPENROUTER_API_KEY = "..."
 uv run uvicorn main:app --reload --port 8000
 ```
 
-Frontend (Vite, port 5173, proxies `/api` to the backend):
+**Frontend** (port 5173, proxies `/api` to the backend):
 
 ```powershell
 cd frontend
 npm install
+npm run build   # renderer page for the agents' screenshots; repeat after changing scene components
 npm run dev
 ```
 
-**Screenshots for the agents**: `render_scene` opens the built renderer page (`frontend/render.html`,
-which reuses the scene components) in a headless browser. Build the frontend once, and again after
-changing scene components; the backend serves the build under `/renderer/`:
+Then open http://localhost:5173. The API docs are at http://127.0.0.1:8000/docs.
 
-```powershell
-cd frontend
-npm run build
-```
-
-If the backend does not run on port 8000, set `RENDER_PAGE_URL` (e.g. `http://127.0.0.1:8001/renderer/render.html`).
-The renderer uses Playwright's Chromium, otherwise Edge or Chrome (`uv run playwright install chromium`).
-Screenshots are grouped per run in `src/data/renders/runs/<run_id>/<seq>_v<version>_<trigger>/` (with a
-`manifest.json`); identical rooms are rendered once (`src/data/renders/cache/<hash>/`) and copied. The selected model must
-accept images (`DESIGNER_TEXT_ONLY_FALLBACK=1` explicitly allows text-only models).
-
-Tests (backend; the rendering tests need the frontend build):
+**Tests** (the rendering tests need the frontend build):
 
 ```powershell
 cd src
 uv run pytest
 ```
 
-Then open http://localhost:5173. API docs: http://127.0.0.1:8000/docs
+## Using the app
+
+1. **Search** (right sidebar): find models, view details and add them to the inventory.
+2. **Inventory**: filter your models, click "Place", then click on the floor.
+3. **Design** (left sidebar): describe what you want. Options control whether the AI may add
+   furniture from the inventory, remove furniture, search online, download automatically or ask you,
+   how many designer steps and furniture lists it may use, and whether the critic reviews the result.
+4. **Overview**: opens automatically and shows the run live, including the approval panel when a
+   decision is needed.
 
 ## Project structure
 
 ```
-src/                         backend (FastAPI, LangGraph), run everything from here
-  main.py                    FastAPI app: includes the routers, serves the renderer build
-  asset_api.py               client + routes for the 3d.shep.bot REST API (/api/assets)
-  inventory.py               inventory service: download, verify, register (data/inventory.json)
-  inventory_api.py           inventory routes (/api/inventory)
-  design_api.py              workflow routes (/api/design): start, SSE events, approval, cancel
-  llm.py, url_safety.py      OpenRouter client (retries, structured output), public-URL guard
-  design/                    LangGraph graph: state, routing, one module per node, validator geometry
-  research/                  Furniture Research agent, MCP client, preview images
-  furniture/                 LanceDB store, embeddings, AI enrichment, shared asset pipeline, routes
-  rendering/                 headless Playwright renderer (screenshots, model measuring), routes
-  observability/             run store (events), progress events, graph view, serialization
-  tests/                     pytest suite (LLM, MCP and downloads are faked)
-frontend/                    React + Vite + React Three Fiber
-  src/components/            scene, sidebars, design panel, overview (graph, timeline, inspector, approval)
-  src/observability/         SSE run hook and event -> run state derivation
-  src/render/                headless renderer page used by render_scene (render.html)
-docs/                        graph and furniture database documentation
+src/                     backend (run everything from here)
+  design/                design workflow: graph, state, routing, runner, router, designer, critic,
+                         validator and render nodes
+  research/              furniture lists: research coordinator, human approval, asset download,
+                         background jobs, MCP client
+  furniture/             LanceDB store, embeddings, AI enrichment, shared asset pipeline
+  rendering/             headless Playwright renderer (screenshots, model measuring)
+  observability/         run store, progress events, graph view
+  prompts/               the agents' system prompts as Markdown files
+  tests/                 pytest suite
+  main.py, *_api.py      FastAPI app and routes; llm.py is the OpenRouter client
+frontend/src/
+  components/            scene, sidebars, design panel, run overview
+  observability/         SSE run hook and run state
+  render/                headless renderer page used by Render Scene
+docs/                    graph and furniture database documentation
 ```
 
-Browser storage keys still use the former product name (`roomforge.layout`, `roomforge.designModel`,
-`roomforge.designOptions`) so existing layouts and settings keep working.
+Static prompts live in `src/prompts/` (one file per prompt, sent exactly as written). The messages
+that carry the room, layout, validation results and screenshots are built in Python by each agent.
+Edit a file to change a prompt; `tests/test_prompts.py` checks that every file is loaded.
 
-## Using the app
+Downloaded models are stored in `src/data/inventory/`, the furniture database in
+`src/data/furniture_db/` and screenshots per run in `src/data/renders/`. The room layout lives in
+the browser (localStorage; the keys still use the former name `roomforge.*`).
 
-1. **Search** (right sidebar): find models, view details, add them to the inventory.
-2. **Inventory**: "Place", then click on the floor.
-3. **Edit**: click a piece to move or rotate it (gizmo); `R` rotates by 45°, `Del` removes, `Esc` cancels.
-4. **AI** (left sidebar, "Design" tab): describe what you want. The request goes through the agent
-   workflow below. Only validated layouts are applied to the room; "Previous layout" undoes it.
-   Options: "Include more furniture" (the designer may add inventory pieces), "Allow removing furniture"
-   and "Max. iterations".
-5. **Overview** tab: opens automatically and shows the run live (graph, timers, timeline, details,
-   pending approvals). Events stream via SSE from `/api/design/runs/{id}/events`.
+## Limitations and Future Work
 
-## Agent workflow
-
-See [docs/graph.md](docs/graph.md) for the diagram and the state description.
-
-- **Orchestrator** classifies the request: `DESIGN_ROOM`, `CRITIQUE_ROOM`, `SEARCH_FURNITURE` or `REJECT`
-  (off-topic requests and manipulation attempts; an injection filter runs before the LLM).
-- **Render Scene** (one shared node) renders the current working layout: the first look at the room,
-  after a validated substantial change (or outdated screenshots) and for the critic. The designer
-  cannot request renders itself.
-- **Interior Designer** proposes layouts and decides the next step: validate, request furniture,
-  request a critique, or finish (only with a validated layout).
-- **Layout Validator** checks boundaries and collisions deterministically, corrects small errors
-  (max. 15 cm, `ValidatorConfig` in `src/design/validator.py`) and returns to the designer, through
-  Render Scene when the valid layout changed substantially.
-- **Interior Critic** evaluates a layout (standalone or for the designer) without changing it.
-- **Furniture Research** searches via the asset server's MCP endpoint (`https://3d.shep.bot/mcp`,
-  `ASSET_MCP_URL`), looks at previews and proposes 3–5 models. **Human Approval** pauses the run
-  (LangGraph `interrupt()`); **Asset Download** fetches only approved models and returns to the research,
-  which hands the result to its caller (the designer or the user).
-
-Loop limits are defined in `src/design/routing.py` (`LIMITS`). A run can be aborted at any time
-(Abort run in the Design tab, the Overview or the approval panel); it is never resumed and nothing of it is applied.
-
-## Furniture database
-
-Every downloaded model (from the search sidebar or approved by the research agent) goes through one
-pipeline: download → measure → AI description (vision LLM) → LanceDB (`src/data/furniture_db/`).
-Furniture Research searches this database first and only uses the external asset server when nothing
-local fits. Details: [docs/furniture-db.md](docs/furniture-db.md).
-
-- `GET /api/furniture/search?q=...&category=...` semantic search with filters
-- `POST /api/furniture/reindex` index inventory items downloaded before the database existed
-
-Downloaded models live in `src/data/inventory/<id>/`, metadata in `src/data/inventory.json`.
-Placed furniture is stored in the browser (localStorage).
+- **Persistent runs:** Implement a persistent checkpointer (e.g., SQLite) to allow paused runs to resume after a backend restart.
+- **Customizable walls and floors:** Allow users and the designer agent to modify wall and floor styles, including colors, materials, and textures.
+- **Flexible room layouts:** Enable users to adjust room dimensions (length, width, and height) and add architectural elements such as doors and windows.

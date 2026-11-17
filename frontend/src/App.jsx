@@ -228,10 +228,13 @@ export default function App() {
     const snapshot = instances;
     let result;
     try {
-      result = await designRun.start({ request, model, models, options, ...buildDesignInput() });
+      // Furniture downloaded during the run shows up in the inventory right away.
+      result = await designRun.start({ request, model, models, options, ...buildDesignInput() },
+        { onDownloaded: loadInventory });
     } catch (err) {
-      // Aborted or failed: the room stays as it is, but downloaded furniture is already on the server.
-      if (err.downloaded) loadInventory();
+      // Aborted or failed: the room stays as it is, but furniture downloaded meanwhile is already on the
+      // server. Downloads that finished during an approval pause were never reported, so always reload.
+      loadInventory();
       throw err;
     }
     // Furniture the run downloaded (directly or via the designer's delegated research) is new on the
@@ -249,7 +252,17 @@ export default function App() {
     return result;
   };
 
-  // Restores the complete room as it was before the design, including removed and added pieces.
+  // Empties the room (the inventory stays). "Previous layout" in the Design tab brings it back.
+  const removeAll = () => {
+    if (!instances.length) return;
+    if (!window.confirm(`Remove all ${instances.length} pieces from the room? The inventory is kept, and “Previous layout” in the Design tab restores the room.`)) return;
+    setLayoutBeforeDesign(instances);
+    setInstances([]);
+    setSelectedId(null);
+    setPlacingId(null);
+  };
+
+  // Restores the complete room as it was before the design (or "Remove all"), including removed and added pieces.
   const undoDesign = () => {
     if (!layoutBeforeDesign) return;
     setInstances(layoutBeforeDesign);
@@ -261,7 +274,14 @@ export default function App() {
     if (dimensionRequests.current.has(itemId)) return;
     dimensionRequests.current.add(itemId);
     api.setDimensions(itemId, dimensions)
-      .then((updated) => setInventory((list) => list.map((i) => (i.id === itemId ? updated : i))))
+      .then((updated) => {
+        setInventory((list) => list.map((i) => (i.id === itemId ? updated : i)));
+        // Pieces placed before the measurement used scale 1; a model in other units gets its unit scale now.
+        const s = updated.unitScale ?? 1;
+        if (s !== 1) {
+          setInstances((list) => list.map((i) => (i.assetId === itemId && i.scale[0] === 1 ? { ...i, scale: [s, s, s] } : i)));
+        }
+      })
       .catch(() => dimensionRequests.current.delete(itemId));
   }, []);
 
@@ -307,6 +327,12 @@ export default function App() {
         <header className="topbar">
           <h1>RoomCraft</h1>
           <span className="muted small">{instances.length} {instances.length === 1 ? 'object' : 'objects'} in the room</span>
+          {instances.length > 0 && (
+            <button className="danger topbar-action" onClick={removeAll} disabled={designRun.active}
+              title={designRun.active ? 'Not available while the agents are working' : 'Remove every piece from the room (the inventory is kept)'}>
+              Remove all
+            </button>
+          )}
         </header>
 
         {notice && (

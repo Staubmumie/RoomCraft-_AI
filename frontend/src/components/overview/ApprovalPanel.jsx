@@ -1,14 +1,25 @@
 import { useState } from 'react';
 import { formatDimensions, LicenseLabel, Thumbnail } from '../common.jsx';
 
-// Shown while a run waits for the user: compare the proposed assets, pick some to download,
-// or ask for other suggestions. Nothing is downloaded until "Download" is confirmed.
+const CHECK_LABELS = { category: 'type', size: 'size', style: 'style', quality: 'model', license: 'licence' };
+export const PROGRESS_LABELS = {
+  searching_local: 'searching locally', searching_online: 'searching online', retrying: 'searching again',
+  pending: 'queued', awaiting_approval: 'ready for you', downloading: 'downloading', completed: 'downloaded',
+  found_locally: 'in the inventory', failed: 'download failed', skipped: 'skipped', rejected: 'rejected',
+  not_found: 'not found'
+};
+
+// Shown while a run waits for the user: ONE item of the furniture list at a time. The other items
+// keep being searched and downloaded in the background; nothing is downloaded until "Download" is confirmed.
 export default function ApprovalPanel({ approval, onRespond, onAbort, aborting }) {
   const [selected, setSelected] = useState(() => new Set());
   const [feedback, setFeedback] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const candidates = approval.candidates || [];
+  const request = approval.request || {};
+  const lastRun = approval.run >= (approval.maxRuns || 2);
+  const others = Object.entries(approval.progress || {});
 
   const toggle = (assetId) => setSelected((current) => {
     const next = new Set(current);
@@ -21,7 +32,10 @@ export default function ApprovalPanel({ approval, onRespond, onAbort, aborting }
     setBusy(true);
     setError('');
     try {
-      await onRespond({ action, selected: action === 'approve' ? [...selected] : [], feedback });
+      await onRespond({
+        itemKey: approval.itemKey, run: approval.run, action,
+        selected: action === 'approve' ? [...selected] : [], feedback
+      });
     } catch (err) {
       setError(err.message);
       setBusy(false);
@@ -31,10 +45,23 @@ export default function ApprovalPanel({ approval, onRespond, onAbort, aborting }
   return (
     <section className="approval" aria-label="Approval">
       <div className="approval-header">
-        <strong>Please choose</strong>
-        <span className="small muted">Round {approval.round} · {candidates.length} suggestions</span>
+        <strong>
+          Item {approval.index} of {approval.total}
+          {request.essential && <span className="badge warn">Essential</span>}
+          {approval.run > 1 && <span className="badge warn">2nd search</span>}
+        </strong>
+        <span className="small muted">{candidates.length} suggestion{candidates.length === 1 ? '' : 's'}</span>
       </div>
-      {approval.summary && <p className="small">{approval.summary}</p>}
+      <div className="approval-request">
+        <p><b>{request.description}</b></p>
+        {(request.purpose || request.size || request.style || request.colors_materials) && (
+          <p className="small muted">
+            {[request.purpose, request.size, request.style, request.colors_materials].filter(Boolean).join(' · ')}
+          </p>
+        )}
+        {approval.intent && <p className="small">Research: {approval.intent}</p>}
+        {approval.summary && <p className="small muted">{approval.summary}</p>}
+      </div>
 
       <div className="approval-list">
         {candidates.map((c) => (
@@ -47,7 +74,11 @@ export default function ApprovalPanel({ approval, onRespond, onAbort, aborting }
               {c.description && <p className="small clamp">{c.description}</p>}
               <div className="badges">
                 {c.formats.map((f) => <span key={f} className={`badge ${f === 'glb' || f === 'gltf' ? 'ok' : ''}`}>{f}</span>)}
-                {c.dimensions && <span className="badge">{formatDimensions(c.dimensions)}</span>}
+                <span className="badge">{c.dimensions ? formatDimensions(c.dimensions) : 'size unknown'}</span>
+                {Object.entries(c.checks || {}).map(([check, value]) => (
+                  <span key={check} className={`badge ${value === 'ok' ? 'ok' : value === 'fails' ? 'warn' : ''}`}
+                    title={`${CHECK_LABELS[check] ?? check}: ${value}`}>{CHECK_LABELS[check] ?? check} {value}</span>
+                ))}
               </div>
               <p className="small"><LicenseLabel license={c.license} /></p>
               <p className="small reason">{c.reason}</p>
@@ -62,21 +93,36 @@ export default function ApprovalPanel({ approval, onRespond, onAbort, aborting }
 
       <textarea className="approval-feedback" rows={2} value={feedback} disabled={busy}
         onChange={(e) => setFeedback(e.target.value)}
-        placeholder="Optional feedback, e.g. “darker wood” or “smaller furniture”" />
+        placeholder={lastRun ? 'Optional feedback' : 'Optional feedback for the second search, e.g. “darker wood” or “smaller”'} />
       <div className="card-actions">
         <button className="primary" disabled={busy || selected.size === 0} onClick={() => send('approve')}>
           {selected.size ? `Download ${selected.size}` : 'Download selection'}
         </button>
-        <button disabled={busy} onClick={() => send('retry')}>Other suggestions</button>
-        <button className="danger" disabled={busy} onClick={() => send('reject')}>Reject all</button>
+        <button disabled={busy} onClick={() => send('reject')}
+          title={lastRun ? 'No further search: this item is skipped' : 'Search this item once more with other terms; you continue with the next item meanwhile'}>
+          {lastRun ? 'Nothing fits – skip' : 'Nothing fits'}
+        </button>
+        {!lastRun && <button disabled={busy} onClick={() => send('skip')} title="End this item without another search">Skip</button>}
         {onAbort && (
           <button className="danger" disabled={aborting} onClick={onAbort}
-            title="End the whole run; nothing is downloaded or applied">
+            title="End the whole run; nothing more is downloaded or applied">
             {aborting ? 'Aborting…' : 'Abort run'}
           </button>
         )}
       </div>
-      {busy && <p className="muted small"><span className="spinner" /> Resuming…</p>}
+      {others.length > 0 && (
+        <p className="small muted research-progress">
+          Other items: {others.map(([status, n]) => <span key={status} className="badge">{n} {PROGRESS_LABELS[status] ?? status}</span>)}
+        </p>
+      )}
+      {approval.localDone?.length > 0 && (
+        <ul className="small muted approval-done">
+          {approval.localDone.map((d) => (
+            <li key={d.description}>✓ {d.description}: {d.items.map((i) => i.name).join(', ')}</li>
+          ))}
+        </ul>
+      )}
+      {busy && <p className="muted small"><span className="spinner" /> Continuing…</p>}
       {error && <p className="error small">{error}</p>}
     </section>
   );

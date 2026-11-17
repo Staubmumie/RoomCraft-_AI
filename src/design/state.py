@@ -71,7 +71,8 @@ class DesignState(TypedDict, total=False):
     room: Room
     furniture: list[Furniture]      # the confirmed room; agents work on proposed_layout instead
     preferences: dict               # TODO: user preferences / budget from long-term memory
-    # per request: allow_new_furniture, allow_removal, final_review, limits {"designer_steps": n, "research_requests": n}
+    # per request: allow_new_furniture, allow_removal, final_review, search_online, review_suggestions,
+    # limits {"designer_steps": n, "research_requests": n}
     options: dict
 
     # --- Control flow ------------------------------------------------------------------------
@@ -105,7 +106,7 @@ class DesignState(TypedDict, total=False):
     # Completeness check of the designer's latest step: [{"item", "essential", "reason"}]. Essential
     # gaps trigger research when still possible, otherwise they become warnings of the result.
     furniture_gaps: list[dict]
-    researched: Annotated[list[str], operator.add]  # descriptions of all furniture requests of this run
+    researched: Annotated[list[str], operator.add]  # descriptions of all requested list items of this run, one each
 
     # --- Layout Validator ----------------------------------------------------------------------
     validation: Any                 # design.validator.ValidationResult
@@ -125,19 +126,24 @@ class DesignState(TypedDict, total=False):
     # Set when the designer's validated layout went to the final review (options["final_review"]):
     # {"proposed_layout", "layout_version", "validation"}. It is the result if later changes fail.
     reviewed_layout: dict
+    # Set once per run by the critic (issues or suggestions, adding allowed, online search on): one
+    # more furniture list for the designer (routing.limit).
+    critic_research_bonus: bool
 
     # --- Furniture Research ----------------------------------------------------------------------
-    furniture_request: dict         # structured request from the designer; absent for direct searches
-    research_round: int
-    research_status: str            # awaiting_approval | done
-    research_summary: str
-    candidates: list[dict]          # external shortlist awaiting the user's choice: metadata and image URLs only
-    local_candidates: list[dict]    # suitable items already in the furniture database (no download needed)
-    local_assessment: str           # the agent's reason why local items were (not) enough
-    rejected_asset_ids: list[str]   # not proposed again
-    approval: dict | None           # {"action": approve|reject|retry, "selected": [...], "feedback": str}
-    download_result: dict | None    # {"added": [...], "existing": [...], "failed": [...]}
-    research_result: dict           # final result handed to the caller (designer or user)
+    # The list to research: {"items": [{description, purpose, size, style, colors_materials, essential}],
+    # "style", "budget", "origin"}; set by the designer or (one item per piece) by the orchestrator.
+    furniture_request: dict
+    # One entry per list item, the persistent state of its search (see research.agent):
+    # {"key", "index", "request", "status", "run", "job", "online", "candidates", "local", "selected",
+    #  "approved_by", "approved_run", "rejected_asset_ids", "feedback", "downloads": [{assetId, name, status, ...}], ...}
+    research_items: list[dict]
+    research_batch: dict            # {"id", "online" (counted as a research request), "seq", "shared": {style, budget}}
+    research_status: str            # "" (new list) | active | awaiting_approval | download | done
+    approval_item: str | None       # key of the item shown to the user (human_approval)
+    approval: dict | None           # last decision {"itemKey", "action": approve|reject|skip, "selected", "feedback"}
+    download_result: dict | None    # downloads merged by the latest research step {"added", "existing", "failed"}
+    research_result: dict           # final result handed to the caller (designer or user), one entry per item
 
     # --- Final result of a design run ----------------------------------------------------------
     layout: list[Furniture]         # validated layout the frontend applies (all pieces, incl. new ones)

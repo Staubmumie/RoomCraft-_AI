@@ -59,11 +59,14 @@ inventory item also deletes its record.
    colours, materials, features, description, tags).
 3. Results below a minimum score (0.25 for the research agent) are dropped; the agent sees the scores.
 
-Furniture Research is local-first: before its first LLM call it searches the database with the request,
-can refine the local search with filters, and opens the MCP connection only when it decides to search
-externally. It must state why local items were (not) enough (`local_assessment`). Local finds need no
-approval; external assets still go through Human Approval -> Asset Download. External results that are
-already in the inventory are treated as local.
+For direct user searches Furniture Research is local-first, per item of the furniture list: it searches
+the database with the item's description, then an LLM checks the best matches against the item's
+essential requirements (`choose_local_item`, may refine once with filters); a match is only taken when
+every listed requirement is met, a category match alone is not enough. Only items without a local match
+are searched online (MCP), if the online search is enabled. Local finds need no approval, no download
+and no online budget; external assets go through Human Approval (or the automatic choice) -> Asset
+Download. Requests of the interior designer skip the local check (it already sees the inventory).
+External results that are already in the inventory are treated as local.
 
 Embedding model: `EMBEDDING_MODEL` (default `openai/text-embedding-3-small`, 1536 dimensions). Rows written
 with another model are re-embedded by `FurnitureStore.ensure_model()` (called by reindex); a different vector

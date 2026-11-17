@@ -17,6 +17,9 @@ from contextlib import AsyncExitStack
 import anyio
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
+from mcp.shared._httpx_utils import create_mcp_http_client
+
+from asset_rate import throttle_request
 
 MCP_URL = os.environ.get("ASSET_MCP_URL", "https://3d.shep.bot/mcp")
 CALL_TIMEOUT_S = 30.0
@@ -24,6 +27,20 @@ CALL_TIMEOUT_S = 30.0
 
 class AssetMCPError(Exception):
     pass
+
+
+class EventStreamDisabled(Exception):
+    pass
+
+
+async def _no_event_stream(request) -> None:
+    """Refuses the optional GET stream for server-initiated messages before it is sent. The asset
+    server closes that stream at once and the MCP client reconnects every second while the session
+    is open (about 60 requests per minute per session, measured), which alone exhausted the server's
+    rate limit. Tool results arrive in the responses to their POST requests, so nothing is lost; the
+    client stops trying after two refused attempts."""
+    if request.method == "GET":
+        raise EventStreamDisabled("The GET event stream is not used.")
 
 
 def parse_tool_result(result) -> dict:
@@ -49,7 +66,12 @@ class AssetMCP:
     async def __aenter__(self) -> "AssetMCP":
         self._stack = AsyncExitStack()
         try:
-            streams = await self._stack.enter_async_context(streamable_http_client(self.url))
+            # MCP's own client (its timeouts), without the GET event stream and with the shared rate limit
+            # of the asset server on every request.
+            http = await self._stack.enter_async_context(create_mcp_http_client())
+            http.event_hooks = {**http.event_hooks,
+                                "request": [*http.event_hooks.get("request", []), _no_event_stream, throttle_request]}
+            streams = await self._stack.enter_async_context(streamable_http_client(self.url, http_client=http))
             self._session = await self._stack.enter_async_context(ClientSession(streams[0], streams[1]))
             with anyio.fail_after(self.timeout_s):
                 await self._session.initialize()

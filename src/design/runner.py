@@ -20,6 +20,7 @@ from design.state import DesignState, Furniture
 from llm import LLMError
 from observability.store import Run, RunStore
 from rendering.service import RenderError
+from research import jobs as research_jobs
 from research.mcp_client import AssetMCPError
 
 CUSTOM_EVENT_TYPES = {"stage": "node.progress", "llm": "node.llm", "tool": "node.tool"}
@@ -99,16 +100,22 @@ def summarize(node: str, update: dict) -> str:
         critique = update.get("critique") or {}
         return f"v{update.get('critiqued_layout_version')} · {len(critique.get('issues', []))} issue(s)"
     if node == "furniture_research":
-        if update.get("research_status") == "awaiting_approval":
-            return f"round {update.get('research_round', 1)} · {len(update.get('candidates', []))} candidate(s)"
-        return f"finished: {(update.get('research_result') or {}).get('status', '?')}"
+        items = update.get("research_items") or []
+        status = update.get("research_status")
+        if status == "awaiting_approval":
+            item = next((i for i in items if i["key"] == update.get("approval_item")), None) or {}
+            return (f"item {item.get('index')}/{len(items)} · run {item.get('run')} · "
+                    f"{len(item.get('candidates') or [])} suggestion(s)")
+        if status == "download":
+            return f"{sum(e['status'] == 'queued' for i in items for e in i['downloads'])} download(s) to start"
+        return f"finished: {(update.get('research_result') or {}).get('status', '?')} · {len(items)} item(s)"
     if node == "human_approval":
         approval = update["approval"]
         return {"approve": f"approved {len(approval['selected'])} asset(s)",
-                "retry": "asked for other suggestions", "reject": "rejected all"}[approval["action"]]
+                "reject": "nothing fits", "skip": "skipped"}[approval["action"]]
     if node == "asset_download":
-        r = update["download_result"]
-        return f"{len(r['added'])} added · {len(r['existing'])} existing · {len(r['failed'])} failed"
+        running = sum(e["status"] == "running" for i in update.get("research_items") or [] for e in i["downloads"])
+        return f"{running} download(s) running"
     return ""
 
 
@@ -150,9 +157,14 @@ def _ms(since: float) -> int:
     return round((time.perf_counter() - since) * 1000)
 
 
+RECURSION_LIMIT = 200
+
+
 def graph_config(run: Run) -> dict:
-    """The run id is the LangGraph thread: a paused run resumes exactly where it stopped."""
-    return {"configurable": {"thread_id": run.id}}
+    """The run id is the LangGraph thread: a paused run resumes exactly where it stopped. Every step
+    is bounded by the limits in design.routing; the recursion limit only has to leave room for them
+    (a furniture list adds coordinator/download steps per item)."""
+    return {"configurable": {"thread_id": run.id}, "recursion_limit": RECURSION_LIMIT}
 
 
 async def execute_design_run(store: RunStore, run: Run, inputs: DesignState):
@@ -214,8 +226,10 @@ async def _drive(store: RunStore, run: Run, graph_input):
                     update = chunk.get("result") or {}
                     changes = describe_changes(state, update)
                     apply_update(state, update)
-                    if chunk["name"] == "asset_download":
-                        ctx["downloaded"].extend((update.get("download_result") or {}).get("added", []))
+                    # Downloads finish in the background; the research coordinator reports them as they arrive.
+                    for added in (update.get("download_result") or {}).get("added", []):
+                        if added["assetId"] not in {a["assetId"] for a in ctx["downloaded"]}:
+                            ctx["downloaded"].append(added)
                     store.emit(run, "node.completed", node=chunk["name"], execution_id=chunk["id"], status="completed",
                                payload={**timings, "output": update, "summary": summarize(chunk["name"], update),
                                         "changes": changes, "next": next_node(chunk["name"], state)})
@@ -235,9 +249,11 @@ async def _drive(store: RunStore, run: Run, graph_input):
             ctx["wait_started"] = time.perf_counter()
             store.emit(run, "workflow.waiting", status="waiting_for_approval",
                        payload={**timing(), "approval": run.pending_approval})
-            return
+            return  # background research jobs keep running during the pause
 
+        research_jobs.close(run.id)  # nothing may outlive the run
         final = snapshot.values
+        _forget_checkpoint(run.id)  # the run is over: its result and events live on the Run
         outcome = final.get("outcome") or {"status": "failed", "message": "The workflow ended without a result."}
         if outcome["status"] == "failed":
             store.emit(run, "workflow.failed", status="failed", payload={
@@ -248,11 +264,14 @@ async def _drive(store: RunStore, run: Run, graph_input):
         run.result = _result(final, ctx.get("downloaded"))
         store.emit(run, "workflow.completed", status="completed", payload={**timing(), "result": run.result})
     except asyncio.CancelledError:
+        research_jobs.close(run.id)  # no new searches or downloads after an abort
         if not run.finished:
             _close_open_executions(store, run, executions, "Cancelled")
             store.emit(run, "workflow.cancelled", status="cancelled", payload=timing())
         raise
     except Exception as exc:
+        research_jobs.close(run.id)
+        _forget_checkpoint(run.id)
         error_code = None
         if isinstance(exc, LLMError):
             message, status_code = str(exc), exc.status_code
@@ -289,11 +308,19 @@ def settle_cancelled_task(store: RunStore, run: Run):
 
 def discard_run(run: Run):
     """A cancelled run is never resumed: forget its bookkeeping and its LangGraph checkpoint.
-    The events stay, so the run remains visible as cancelled."""
+    The events stay, so the run remains visible as cancelled. Its background research jobs are
+    cancelled: no new downloads start, finished downloads stay in the inventory."""
+    research_jobs.close(run.id)
     run.pending_approval = None
     run.context.clear()
+    _forget_checkpoint(run.id)
+
+
+def _forget_checkpoint(run_id: str) -> None:
+    """Drops the LangGraph checkpoint of a run that can no longer resume (finished, failed or
+    cancelled); the in-memory saver would otherwise keep every run's state for the process lifetime."""
     try:
-        design_graph.checkpointer.delete_thread(run.id)
+        design_graph.checkpointer.delete_thread(run_id)
     except Exception:  # a checkpointer without delete support only keeps a little memory
         pass
 

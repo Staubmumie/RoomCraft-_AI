@@ -5,12 +5,12 @@ import asyncio
 import pytest
 
 from design.graph import design_graph, mermaid
-from design.human_approval import validate_decision
 from design.routing import LIMITS, next_node
 from design.runner import execute_design_run, resume_design_run
 from design.state import Furniture, Room, add_counts, merge
 from observability.graph_view import describe_graph
 from observability.store import RunStore
+from research.human_approval import validate_decision
 from tests.conftest import P, critique, decide
 from tests.research_fakes import ROUND_1, install_research
 
@@ -111,22 +111,29 @@ def test_3_critique_request_ends_after_the_critic(fake_llm):
 
 # --- 4./5. standalone research (details in test_furniture_research.py) ------------------------------
 
+def answer(result, **values):
+    """The user's decision on the item that is waiting for approval."""
+    return validate_decision(result.pending_approval, {"itemKey": result.pending_approval["itemKey"], **values})
+
+
 def test_4_standalone_research_approval_download_research_end(fake_llm, monkeypatch):
     fake_llm(intent="SEARCH_FURNITURE")
     research = install_research(monkeypatch)
     store, result = run("Find a modern wooden cabinet.")
-    asyncio.run(resume_design_run(store, result, validate_decision(
-        result.pending_approval["candidates"], {"action": "approve", "selected": ["polyhaven:oak_cabinet"]})))
+    asyncio.run(resume_design_run(store, result, answer(result, action="approve", selected=["polyhaven:oak_cabinet"])))
     assert started(result) == ["orchestrator", "furniture_research", "human_approval", "asset_download", "furniture_research"]
     assert research.downloads == ["polyhaven:oak_cabinet"]
     assert result.result["kind"] == "research" and result.events[-1]["type"] == "workflow.completed"
 
 
-def test_5_rejected_furniture_goes_back_to_research_which_ends(fake_llm, monkeypatch):
+def test_5_rejected_furniture_is_searched_again_then_skipped_and_research_ends(fake_llm, monkeypatch):
     fake_llm(intent="SEARCH_FURNITURE")
     research = install_research(monkeypatch)
     store, result = run("Find a modern wooden cabinet.")
-    asyncio.run(resume_design_run(store, result, {"action": "reject", "selected": [], "feedback": ""}))
+    asyncio.run(resume_design_run(store, result, answer(result, action="reject")))
+    assert started(result)[-3:] == ["human_approval", "furniture_research", "human_approval"]  # second run
+    assert result.pending_approval["run"] == 2
+    asyncio.run(resume_design_run(store, result, answer(result, action="skip")))
     assert started(result)[-2:] == ["human_approval", "furniture_research"]
     assert result.result["downloads"]["status"] == "rejected"
     assert research.downloads == []
@@ -143,8 +150,7 @@ def test_6_designer_research_approval_download_research_designer(fake_llm, monke
     # the download makes the cabinet a placeable inventory item
     fake.inventory["polyhaven-oak_cabinet"] = {"item_id": "polyhaven-oak_cabinet", "name": "Oak Cabinet", "scale": 1.0,
                                                "width": 1.0, "depth": 0.5, "height": 1.8}
-    asyncio.run(resume_design_run(store, result, validate_decision(
-        result.pending_approval["candidates"], {"action": "approve", "selected": ["polyhaven:oak_cabinet"]})))
+    asyncio.run(resume_design_run(store, result, answer(result, action="approve", selected=["polyhaven:oak_cabinet"])))
     assert started(result) == ["orchestrator", "render_scene", "interior_designer", "furniture_research", "human_approval",
                                "asset_download", "furniture_research", "interior_designer", "layout_validator",
                                "interior_designer"]
@@ -489,5 +495,42 @@ def test_graph_has_every_node_once_and_the_target_edges():
     assert ("layout_validator", "interior_designer") in edges and ("layout_validator", "__end__") not in edges
     assert ("layout_validator", "render_scene") in edges and ("interior_designer", "render_scene") not in edges
     assert ("asset_download", "furniture_research") in edges and ("asset_download", "__end__") not in edges
+    assert ("furniture_research", "asset_download") in edges  # automatic downloads need no approval
     assert ("orchestrator", "__end__") in edges and ("render_scene", "__end__") not in edges
     assert "flowchart TD" in mermaid()
+
+
+# --- critic bonus for furniture research ------------------------------------------------------------
+
+def test_critic_bonus_is_granted_exactly_once(fake_llm):
+    fake = fake_llm(decide(*CLEAN, action="request_critique", finish=False),
+                    decide(P("a", -1.5, 0), action="request_critique", finish=False),
+                    decide(*CLEAN))
+    fake.critiques = [critique("Too empty.", issues=2), critique("Still empty.", issues=1)]
+    _, result = run(add=True)
+    outputs = [e["payload"]["output"] for e in completed(result, "interior_critic") if "critique" in e["payload"]["output"]]
+    assert len(outputs) == 2
+    assert outputs[0]["critic_research_bonus"] is True and "critic_research_bonus" not in outputs[1]
+    assert any("research bonus granted" in line for line in outputs[0]["workflow_log"])
+    third = fake.designer_calls[2][1]["content"][0]["text"]
+    assert "research_requests 3" in third and "research_pieces" not in third  # 2 + 1 lists
+    assert "use it for pieces that resolve one of its concrete points" in third
+
+
+def test_critic_bonus_only_with_adding_and_online_search():
+    from design.interior_critic import research_bonus_due
+    issues = {"issues": [{"severity": "low"}], "suggestions": []}
+    assert research_bonus_due({"options": {"allow_new_furniture": True}}, issues)
+    assert not research_bonus_due({"options": {"allow_new_furniture": False}}, issues)
+    assert not research_bonus_due({"options": {"allow_new_furniture": True, "search_online": False}}, issues)
+    assert not research_bonus_due({"options": {"allow_new_furniture": True}, "critic_research_bonus": True}, issues)
+    assert not research_bonus_due({"options": {"allow_new_furniture": True}}, {"issues": [], "suggestions": []})
+
+
+def test_limits_include_the_critic_bonus_only_once_granted():
+    from design.routing import limit
+    state = {"options": {"limits": {"research_requests": 2}}}
+    assert limit(state, "research_requests") == 2
+    state["critic_research_bonus"] = True
+    assert limit(state, "research_requests") == 3
+    assert limit(state, "designer_steps") == LIMITS["designer_steps"]  # nothing else changes

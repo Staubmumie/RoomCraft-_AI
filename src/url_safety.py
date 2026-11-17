@@ -5,6 +5,8 @@ from urllib.parse import urlparse
 
 import httpx
 
+from asset_rate import throttle_request
+
 
 class UnsafeURLError(ValueError):
     pass
@@ -30,5 +32,7 @@ async def _check_request(request: httpx.Request) -> None:
 
 
 def public_http_client(**kwargs) -> httpx.AsyncClient:
-    """httpx client that checks every request, including each redirect hop."""
-    return httpx.AsyncClient(follow_redirects=True, event_hooks={"request": [_check_request]}, **kwargs)
+    """httpx client that checks every request, including each redirect hop. Requests to the 3D asset
+    server also wait for the shared rate limit (asset_rate)."""
+    return httpx.AsyncClient(follow_redirects=True, event_hooks={"request": [_check_request, throttle_request]},
+                             **kwargs)

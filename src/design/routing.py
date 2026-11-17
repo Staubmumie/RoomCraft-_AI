@@ -15,9 +15,18 @@ LIMITS = {
     "designer_steps": 8,     # interior_designer invocations
     "validations": 4,        # layout_validator runs
     "critiques": 2,          # interior_critic runs
-    "research_requests": 2,  # furniture requests by the designer (one missing piece each)
-    "research_rounds": 3,    # research + approval rounds per request
+    # furniture LISTS of the designer that went online (fully local lists do not count); a list holds
+    # at most MAX_ITEMS_PER_REQUEST (6) pieces, so this also bounds the pieces searched online
+    "research_requests": 2,
 }
+# A critique with issues or suggestions earns the designer one more furniture list, once per run
+# (state["critic_research_bonus"], see limit()).
+CRITIC_BONUS = {"research_requests": 1}
+# Pieces per furniture list; the furniture research cuts longer lists.
+MAX_ITEMS_PER_REQUEST = 6
+# Technical concurrency limits of the furniture research (not user settings): per-item searches
+# (local check + online search) and asset downloads that run at the same time within one run.
+PARALLEL = {"research": 3, "downloads": 3}
 
 ORCHESTRATOR_ROUTES = {
     "DESIGN_ROOM": "render_scene",
@@ -34,13 +43,25 @@ DESIGNER_ROUTES = {
 }
 VALIDATOR_ROUTES = {"render": "render_scene", "interior_designer": "interior_designer"}
 CRITIC_ROUTES = {"request_render": "render_scene", "interior_designer": "interior_designer", "end": END}
-RESEARCH_ROUTES = {"awaiting_approval": "human_approval", "interior_designer": "interior_designer", "end": END}
-APPROVAL_ROUTES = {"approve": "asset_download", "reject": "furniture_research", "retry": "furniture_research"}
+RESEARCH_ROUTES = {"awaiting_approval": "human_approval", "download": "asset_download",
+                   "interior_designer": "interior_designer", "end": END}
+APPROVAL_ROUTES = {"approve": "asset_download", "reject": "furniture_research", "skip": "furniture_research"}
 
 
 def limit(state: DesignState, counter: str) -> int:
-    """LIMITS, with per-request overrides from options["limits"] (e.g. the user's max. iterations)."""
-    return ((state.get("options") or {}).get("limits") or {}).get(counter, LIMITS[counter])
+    """LIMITS, with per-request overrides from options["limits"] (e.g. the user's max. iterations),
+    plus the critic bonus once it was granted in this run."""
+    base = ((state.get("options") or {}).get("limits") or {}).get(counter, LIMITS[counter])
+    return base + (CRITIC_BONUS.get(counter, 0) if state.get("critic_research_bonus") else 0)
+
+
+def research_mode(state: DesignState) -> str:
+    """How furniture is searched, from the user's options:
+    local_only (no online search) | guided (the user picks from suggestions) | automatic (best fit is downloaded)."""
+    options = state.get("options") or {}
+    if not options.get("search_online", True):
+        return "local_only"
+    return "guided" if options.get("review_suggestions", True) else "automatic"
 
 
 def remaining(state: DesignState, counter: str) -> int:
@@ -83,8 +104,13 @@ def after_critic(state: DesignState) -> str:
 
 
 def after_research(state: DesignState) -> str:
-    if state.get("research_status") == "awaiting_approval" and state.get("candidates"):
+    # The research coordinator shows one list item for approval, hands approved or automatically
+    # chosen assets to asset_download, or returns the finished list to its caller.
+    status = state.get("research_status")
+    if status == "awaiting_approval" and state.get("approval_item"):
         return "awaiting_approval"
+    if status == "download":
+        return "download"
     return caller(state, "furniture_research")
 
 
@@ -93,7 +119,8 @@ def after_approval(state: DesignState) -> str:
 
 
 # node -> (router, path map); used by the graph and to report the chosen next node.
-# asset_download -> furniture_research is a fixed edge.
+# asset_download -> furniture_research is a fixed edge: downloads start in the background, the
+# research coordinator collects their results.
 ROUTERS = {
     "orchestrator": (after_orchestrator, ORCHESTRATOR_ROUTES),
     "render_scene": (after_render, RENDER_ROUTES),

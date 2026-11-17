@@ -1,4 +1,5 @@
 import JsonView from './JsonView.jsx';
+import CritiqueView from '../CritiqueView.jsx';
 import {
   activeDuration, formatDuration, formatTime, liveDuration, STATUS_LABELS, waitingDuration
 } from '../../observability/runState.js';
@@ -109,7 +110,34 @@ function LlmCall({ call }) {
 const TOOL_NAMES = {
   search_assets: 'MCP search', get_asset: 'MCP details', view_preview: 'View preview', search_local_furniture: 'Local search'
 };
-const ACTION_LABELS = { approve: 'Approved', retry: 'Requested new suggestions', reject: 'Rejected all' };
+const ACTION_LABELS = { approve: 'Approved', reject: 'Nothing fits', skip: 'Skipped' };
+const ITEM_STATUS = {
+  pending: 'pending', searching_local: 'local search', searching_online: 'online search', retrying: 'second search',
+  awaiting_approval: 'waiting for approval', downloading: 'downloading', completed: 'downloaded',
+  found_locally: 'in the inventory', failed: 'download failed', skipped: 'skipped', rejected: 'rejected',
+  not_found: 'not found'
+};
+
+// The furniture list as the research step left it: one line per item with its status.
+function ResearchItems({ items }) {
+  return (
+    <ul className="problem-list small">
+      {items.map((item) => (
+        <li key={item.key}>
+          <span className="badge">{ITEM_STATUS[item.status] ?? item.status}</span>{' '}
+          {item.index}. {item.request.description}
+          {item.request.essential && <span className="badge warn">essential</span>}
+          {item.run > 0 && <span className="muted"> · run {item.run}</span>}
+          {item.downloads?.length > 0 && (
+            <span className="muted"> · {item.downloads.map((d) => `${d.name} (${d.status})`).join(', ')}</span>
+          )}
+          {item.local?.length > 0 && <span className="muted"> · {item.local.map((l) => l.name).join(', ')}</span>}
+          {item.note && <span className="muted"> · {item.note}</span>}
+        </li>
+      ))}
+    </ul>
+  );
+}
 
 function ToolCalls({ tools }) {
   return (
@@ -208,45 +236,38 @@ export default function ExecutionInspector({ execution, labels, now, clockOffset
           {output.finish_when_valid ? ' · finish once valid' : ''}
           {output.layout_version != null ? ` · layout v${output.layout_version}` : ''}
         </p>
-        {output.furniture_request && <p className="small muted">Furniture request: {output.furniture_request.description}</p>}
+        {output.furniture_request?.items?.length > 0 && (
+          <p className="small muted">Furniture request: {output.furniture_request.items.map((i) => i.description).join('; ')}</p>
+        )}
       </>)}
 
       {output?.critique && (<>
-        <h4>Critique (layout v{output.critiqued_layout_version})</h4>
-        <p className="small">{output.critique.summary}</p>
-        <div className="badges">
-          {Object.entries(output.critique.scores).map(([name, score]) => <span key={name} className="badge">{name}: {score}/5</span>)}
-        </div>
-        <ul className="problem-list small">
-          {output.critique.issues.map((i, n) => <li key={n}><span className="badge">{i.severity}</span> {i.description}</li>)}
-          {output.critique.suggestions.map((s, n) => <li key={`s${n}`}>→ {s}</li>)}
-        </ul>
+        <h4>Critique{output.critiqued_layout_version != null ? ` (layout v${output.critiqued_layout_version})` : ''}</h4>
+        <CritiqueView critique={output.critique} compact />
       </>)}
 
       {output?.workflow_log?.length > 0 && (
         <p className="small muted">{output.workflow_log.join(' · ')}</p>
       )}
 
-      {output?.local_candidates?.length > 0 && (<>
-        <h4>Local matches (already in the inventory)</h4>
-        <ul className="problem-list small">
-          {output.local_candidates.map((c) => (
-            <li key={c.itemId}><strong>{c.name}</strong>{c.score != null ? ` · score ${c.score}` : ''} – {c.reason}</li>
-          ))}
-        </ul>
+      {output?.research_items?.length > 0 && (<>
+        <h4>Furniture list</h4>
+        <ResearchItems items={output.research_items} />
       </>)}
-      {output?.local_assessment && <p className="small muted">Local vs. external: {output.local_assessment}</p>}
 
-      {output?.candidates?.length > 0 && (<>
-        <h4>Proposed assets</h4>
-        {output.research_summary && <p className="small">{output.research_summary}</p>}
-        <Candidates candidates={output.candidates} />
-      </>)}
+      {output?.approval_item && (() => {
+        const item = output.research_items?.find((i) => i.key === output.approval_item);
+        return item?.candidates?.length > 0 && (<>
+          <h4>Proposed assets for item {item.index}</h4>
+          {item.summary && <p className="small">{item.summary}</p>}
+          <Candidates candidates={item.candidates} />
+        </>);
+      })()}
 
       {output?.approval && (<>
         <h4>Decision</h4>
         <p className="small">
-          {ACTION_LABELS[output.approval.action]}
+          {ACTION_LABELS[output.approval.action] ?? output.approval.action}
           {output.approval.selected.length > 0 && `: ${output.approval.selected.join(', ')}`}
         </p>
         {output.approval.feedback && <p className="small muted">Feedback: “{output.approval.feedback}”</p>}

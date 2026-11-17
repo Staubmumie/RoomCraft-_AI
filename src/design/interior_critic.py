@@ -10,17 +10,23 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from design.routing import caller
+from design.routing import CRITIC_BONUS, caller
 from design.scene_images import image_content, load_scene_images
 from design.state import DesignState, model_for
 from design.working_layout import current_version, layout_furniture
 from llm import LLMError, structured_completion
 from observability import progress
+from prompts import load_prompt
+
+
+Aspect = Literal["functionality", "aesthetics", "space_utilization", "preference_fit"]
 
 
 class CritiqueIssue(BaseModel):
     severity: Literal["low", "medium", "high"]
-    description: str
+    aspect: Aspect = Field(description="The score this issue lowers")
+    description: str = Field(description="The concrete problem in this layout: where, which pieces or area, and why "
+                                         "it hurts the room")
     furniture_ids: list[str] = Field(description="Ids of the furniture involved, may be empty")
 
 
@@ -33,17 +39,14 @@ class CritiqueScores(BaseModel):
 
 class Critique(BaseModel):
     summary: str = Field(description="2-3 sentences, in the language of the user's request")
-    scores: CritiqueScores
     strengths: list[str]
     issues: list[CritiqueIssue]
+    # After the observations: structured output is generated in field order, so the scores follow from them.
+    scores: CritiqueScores
     suggestions: list[str] = Field(description="Concrete, actionable improvements (no coordinates needed)")
 
 
-SYSTEM_PROMPT = """You are an independent interior design critic. You evaluate a room layout honestly and constructively: functionality (walkways, access to fronts, sensible groups), aesthetics (balance, style, colours and materials), space utilisation, and how well it fits the user's request and preferences.
-
-Check in particular that every explicit wish of the request is actually served by furniture in the layout (a requested kitchen needs kitchen furniture, not just free space), that related pieces form coherent groups (chairs around and facing their table, seating around a shared focus) and that no piece stands isolated without a purpose. If the designer's plan is given, judge the layout itself, but point out where it misses the plan's requirements or where the plan itself is weak.
-
-You only give feedback; you never change the layout yourself. Base geometric statements on the structured data (metres, room centred on (0, 0), y = height of a piece's bottom above the floor: pieces may stand on rugs, on other pieces or hang on walls, which is not a collision; top-down image: up = back wall, right = +x, 1 m grid, numbered markers = furniture "marker" numbers). Do not invent furniture you think you see in an image. Write in the language of the user's request."""
+SYSTEM_PROMPT = load_prompt("interior_critic_system")
 
 
 def build_messages(state: DesignState, images: list[tuple[str, str]]) -> list[dict]:
@@ -120,4 +123,16 @@ async def interior_critic(state: DesignState) -> dict:
     }
     if requester == "end":  # standalone critique: this is the final answer
         update["outcome"] = {"status": "completed", "kind": "critique", "message": critique_message(critique)}
+    elif research_bonus_due(state, critique):
+        update["critic_research_bonus"] = True
+        update["workflow_log"].append(f"interior_critic: furniture research bonus granted (+{CRITIC_BONUS['research_requests']} "
+                                      "list) for furniture that resolves the critique")
     return update
+
+
+def research_bonus_due(state: DesignState, critique: dict) -> bool:
+    """Once per run: a critique with issues or suggestions earns the designer one more furniture list
+    (routing.CRITIC_BONUS), only when it may add furniture and search online at all."""
+    options = state.get("options") or {}
+    return (not state.get("critic_research_bonus") and bool(critique["issues"] or critique["suggestions"])
+            and bool(options.get("allow_new_furniture")) and options.get("search_online", True) is not False)

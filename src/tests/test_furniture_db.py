@@ -6,20 +6,21 @@ import asyncio
 
 import pytest
 
-import design.asset_download as download_module
 import furniture.enrichment as enrichment_module
 import furniture.pipeline as pipeline
 import inventory
 import inventory_api
-from design.human_approval import validate_decision
+import research.agent as agent
+import research.asset_download as download_module
 from design.runner import execute_design_run, resume_design_run
 from design.state import Room
 from furniture.enrichment import FurnitureEnrichment, generate_furniture_description
 from furniture.store import FurnitureStore, set_store
 from llm import CallInfo, LLMError, StructuredResult
 from observability.store import RunStore
+from research.human_approval import validate_decision
 from tests.conftest import HashEmbedder, png_bytes
-from tests.research_fakes import FakeMCP, call, install_research
+from tests.research_fakes import FakeMCP, call, found, install_research
 
 SOURCES = {
     "polyhaven:oak_chair": {"title": "Oak Dining Chair", "description": "A minimalist wooden chair with a slim backrest.",
@@ -118,6 +119,19 @@ def test_frontend_rejects_assets_that_are_already_in_the_inventory(assets):
     assert err.value.status_code == 409
 
 
+def test_browser_measurement_gets_the_unit_scale(monkeypatch):
+    """Fallback when the server could not measure: the browser reports model units (here centimetres)."""
+    saved = {}
+
+    async def update_item(item_id, **fields):
+        saved.update(fields)
+        return {"id": item_id, **fields}
+
+    monkeypatch.setattr(inventory, "update_item", update_item)
+    asyncio.run(inventory_api.set_dimensions("chair-1", inventory_api.Dimensions(width=50, height=90, depth=50)))
+    assert saved == {"dimensions": {"width": 50, "height": 90, "depth": 50}, "unitScale": 0.01}
+
+
 # --- 2. research download --------------------------------------------------------------------------
 
 def test_2_research_download_is_enriched_and_stored(assets, furniture_store, fake_llm, monkeypatch):
@@ -131,8 +145,8 @@ def test_2_research_download_is_enriched_and_stored(assets, furniture_store, fak
     run = store.create("design")
     asyncio.run(execute_design_run(store, run, {"request": "Find an oak chair", "model": "fake",
                                                 "room": Room(width=8, depth=6, height=2.8), "furniture": []}))
-    asyncio.run(resume_design_run(store, run, validate_decision(
-        run.pending_approval["candidates"], {"action": "approve", "selected": ["polyhaven:oak_chair"]})))
+    asyncio.run(resume_design_run(store, run, validate_decision(run.pending_approval, {
+        "itemKey": run.pending_approval["itemKey"], "action": "approve", "selected": ["polyhaven:oak_chair"]})))
     added = run.result["downloads"]["added"][0]
     assert added["searchable"] is True and added["enrichment"] == "vision"
     record = asyncio.run(furniture_store.get(added["itemId"]))
@@ -183,35 +197,57 @@ def test_search_api(indexed):
 
 # --- 6./7. research: local first, MCP as fallback ------------------------------------------------------
 
-def _start_research(request):
+def _start_research(request, options=None):
     store = RunStore()
     run = store.create("design")
-    asyncio.run(execute_design_run(store, run, {"request": request, "model": "fake",
+    asyncio.run(execute_design_run(store, run, {"request": request, "model": "fake", "options": options or {},
                                                 "room": Room(width=8, depth=6, height=2.8), "furniture": []}))
     return run
+
+
+def choose(item_id, *requirements, reason="Fits."):
+    """The local check's answer: `requirements` as (text, met) pairs."""
+    return [call("choose_local_item", item_id=item_id, reason=reason,
+                 requirements=[{"requirement": r, "met": met} for r, met in requirements])]
+
+
+def started(run):
+    return [e["node"] for e in run.events if e["type"] == "node.started"]
 
 
 def test_6_research_uses_local_results_without_mcp(indexed, fake_llm, monkeypatch):
     fake_llm(intent="SEARCH_FURNITURE")
     item_id = inventory.item_id_for("kenney:reading_armchair")
-    research = install_research(monkeypatch, [call("submit_candidates", summary="You already have a reading armchair.",
-                                                   local_assessment="The local armchair fits the request.",
-                                                   candidates=[{"asset_id": item_id, "reason": "Made for reading"}])])
+    research = install_research(monkeypatch, choose(item_id, ("armchair", True), ("comfortable for reading", True),
+                                                    reason="The local armchair fits the request."))
     run = _start_research("Find a comfortable armchair for reading")
     first_prompt = research.agent.requests[0][1]["content"]
+    assert research.agent.requests[0][0]["content"] == agent.LOCAL_PROMPT
     assert "Reading Armchair" in first_prompt  # local matches were searched before the first LLM call
     assert FakeMCP.instances == []  # no MCP session was opened
-    assert "human_approval" not in [e["node"] for e in run.events if e["type"] == "node.started"]
+    assert "human_approval" not in started(run)
     result = run.result["downloads"]
     assert result["status"] == "found_locally" and result["local"][0]["itemId"] == item_id
-    assert result["local_assessment"] == "The local armchair fits the request."
+    assert result["items"][0]["status"] == "found_locally" and result["items"][0]["runs"] == 0
+
+
+def test_local_match_needs_every_essential_requirement(indexed, fake_llm, monkeypatch):
+    # Same category, but not what was asked for: the local item is not taken, the search goes online.
+    fake_llm(intent="SEARCH_FURNITURE")
+    sofa = inventory.item_id_for("grab3d:leather_sofa")
+    research = install_research(monkeypatch, choose(sofa, ("sofa", True), ("grey fabric", False)),
+                                [call("submit_candidates", summary="none", candidates=[])])
+    run = _start_research("Find a grey fabric sofa", {"review_suggestions": False})
+    assert run.result["downloads"]["items"][0]["status"] == "not_found"
+    assert research.agent.requests[1][0]["content"] == agent.SYSTEM_PROMPT  # went online (direct search prompt)
+    assert "grey fabric" in research.agent.requests[1][1]["content"]
 
 
 def test_7_research_falls_back_to_mcp_when_local_is_not_enough(indexed, fake_llm, monkeypatch):
     fake_llm(intent="SEARCH_FURNITURE")
-    install_research(monkeypatch, [call("search_assets", query="wooden cabinet")],
+    install_research(monkeypatch, choose(None, ("cabinet", False)),
+                     [call("search_assets", query="wooden cabinet")],
                      [call("submit_candidates", summary="Cabinets found externally.",
-                           local_assessment="No cabinet in the database.",
                            candidates=[{"asset_id": "polyhaven:oak_cabinet", "reason": "Oak cabinet"}])])
     run = _start_research("Find a wooden cabinet")
     assert len(FakeMCP.instances) == 1  # MCP opened only for the external search
@@ -221,13 +257,62 @@ def test_7_research_falls_back_to_mcp_when_local_is_not_enough(indexed, fake_llm
 
 def test_external_asset_already_in_inventory_counts_as_local(indexed, fake_llm, monkeypatch):
     fake_llm(intent="SEARCH_FURNITURE")
-    install_research(monkeypatch, [call("submit_candidates", summary="s", local_assessment="a",
-                                        candidates=[{"asset_id": "grab3d:leather_sofa", "reason": "Leather"}])])
-    import research.agent as agent
+    install_research(monkeypatch, choose(None), [call("search_assets", query="leather sofa")],
+                     [call("submit_candidates", summary="s",
+                           candidates=[{"asset_id": "grab3d:leather_sofa", "reason": "Leather"}])])
+    monkeypatch.setattr(FakeMCP, "search", _search_sources)
     monkeypatch.setattr(agent, "inventory_asset_ids",
                         lambda: {"grab3d:leather_sofa": inventory.item_id_for("grab3d:leather_sofa")})
     run = _start_research("Find a leather sofa")
     assert run.result["downloads"]["status"] == "found_locally"  # no download of something we already have
+    assert "human_approval" not in started(run)
+
+
+# --- lists in a direct search: local first ------------------------------------------------------------
+
+def test_list_with_one_local_find_searches_only_the_others_online(indexed, fake_llm, monkeypatch):
+    fake_llm(intent="SEARCH_FURNITURE", furniture_items=["a comfortable armchair for reading", "a floor lamp",
+                                                         "a wool rug"])
+    armchair = inventory.item_id_for("kenney:reading_armchair")
+    research = install_research(monkeypatch, by_item={
+        "armchair": [choose(armchair, ("armchair", True), ("for reading", True))],
+        "lamp": found("floor lamp", "polyhaven:floor_lamp"), "rug": found("wool rug", "polyhaven:wool_rug")})
+    run = _start_research("An armchair for reading, a floor lamp and a rug", {"review_suggestions": False})
+    result = {i["description"]: i for i in run.result["downloads"]["items"]}
+    assert result["a comfortable armchair for reading"]["status"] == "found_locally"
+    assert result["a comfortable armchair for reading"]["runs"] == 0  # no online search, no approval
+    assert result["a floor lamp"]["status"] == result["a wool rug"]["status"] == "completed"
+    assert research.agent.calls_by_item == {"armchair": 1, "lamp": 2, "rug": 2}
+    assert len(FakeMCP.instances) == 2  # online only for the two pieces not found locally
+    spent = {}
+    for e in run.events:
+        if e["type"] == "node.completed" and e["node"] == "furniture_research":
+            for counter, n in e["payload"]["output"]["counters"].items():
+                spent[counter] = spent.get(counter, 0) + n
+    assert spent == {}  # direct searches count no list
+
+
+def test_fully_local_list_uses_no_research_budget(indexed, fake_llm, monkeypatch):
+    fake_llm(intent="SEARCH_FURNITURE", furniture_items=["a comfortable armchair for reading", "a leather sofa"])
+    research = install_research(monkeypatch, by_item={
+        "armchair": [choose(inventory.item_id_for("kenney:reading_armchair"), ("armchair", True))],
+        "sofa": [choose(inventory.item_id_for("grab3d:leather_sofa"), ("sofa", True), ("leather", True))]})
+    run = _start_research("An armchair and a leather sofa")
+    assert {i["status"] for i in run.result["downloads"]["items"]} == {"found_locally"}
+    assert FakeMCP.instances == [] and research.downloads == [] and "human_approval" not in started(run)
+    research_out = [e["payload"]["output"] for e in run.events
+                    if e["type"] == "node.completed" and e["node"] == "furniture_research"][-1]
+    assert research_out["counters"] == {}  # no research_requests
+
+
+def test_local_only_list_finds_local_pieces_and_reports_the_rest(indexed, fake_llm, monkeypatch):
+    fake_llm(intent="SEARCH_FURNITURE", furniture_items=["a comfortable armchair for reading", "a floor lamp"])
+    install_research(monkeypatch, by_item={
+        "armchair": [choose(inventory.item_id_for("kenney:reading_armchair"), ("armchair", True))]})
+    run = _start_research("An armchair and a lamp", {"search_online": False})
+    result = {i["description"]: i for i in run.result["downloads"]["items"]}
+    assert result["a comfortable armchair for reading"]["status"] == "found_locally"
+    assert result["a floor lamp"]["status"] == "not_found" and FakeMCP.instances == []
 
 
 # --- 8.-10. consistency -----------------------------------------------------------------------------------

@@ -7,13 +7,13 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from design.graph import design_graph
-from design.human_approval import ApprovalError, validate_decision
 from design.runner import cancel_waiting_run, execute_design_run, resume_design_run, settle_cancelled_task
 from design.routing import LIMITS
 from design.state import Furniture, Room
 from llm import AGENT_MODELS, AVAILABLE_MODELS, DEFAULT_MODEL, HELPER_MODEL
 from observability.graph_view import describe_graph
 from observability.store import RunStore
+from research.human_approval import ApprovalError, validate_decision
 
 router = APIRouter(prefix="/api/design", tags=["design"])
 runs = RunStore()
@@ -24,9 +24,12 @@ class DesignOptions(BaseModel):
     allowRemoval: bool = Field(default=False, description="The designer may remove furniture of the room")
     maxIterations: int = Field(default=LIMITS["designer_steps"], ge=1, le=15,
                                description="Max. designer steps (LLM calls of the interior designer)")
-    maxResearch: int = Field(default=LIMITS["research_requests"], ge=0, le=10,
-                             description="Max. furniture searches the designer may start (one missing piece each)")
+    maxResearch: int = Field(default=LIMITS["research_requests"], ge=0, le=5,
+                             description="Max. furniture lists of the designer that go online (up to 6 pieces each)")
     finalReview: bool = Field(default=True, description="The critic reviews the validated layout once before finishing")
+    searchOnline: bool = Field(default=True, description="Furniture may be searched online (MCP) and downloaded")
+    reviewSuggestions: bool = Field(default=True, description="The user picks from up to four suggestions per piece; "
+                                                              "off: the best suitable match is downloaded automatically")
 
 
 class DesignRequest(BaseModel):
@@ -109,6 +112,10 @@ async def start_run(body: DesignRequest):
             "allow_new_furniture": body.options.allowNewFurniture,
             "allow_removal": body.options.allowRemoval,
             "final_review": body.options.finalReview,
+            "search_online": body.options.searchOnline,
+            # Only meaningful with online search; stored explicitly, so automatic downloads always
+            # trace back to this option.
+            "review_suggestions": body.options.reviewSuggestions or not body.options.searchOnline,
             "limits": {"designer_steps": body.options.maxIterations,
                        "research_requests": body.options.maxResearch},
         },
@@ -148,20 +155,25 @@ async def stream_events(run_id: str, request: Request, after: int = 0):
 
 
 class ApprovalDecision(BaseModel):
-    action: Literal["approve", "reject", "retry"]
+    itemKey: str = Field(min_length=1, max_length=40, description="The furniture item the decision is for")
+    run: int | None = Field(default=None, ge=1, description="Search run of the item the user saw (optional)")
+    action: Literal["approve", "reject", "skip"]
     selected: list[str] = Field(default_factory=list, max_length=10)
     feedback: str = Field(default="", max_length=1000)
 
 
 @router.post("/runs/{run_id}/approval", status_code=202)
 async def answer_approval(run_id: str, body: ApprovalDecision):
-    """Resumes a run paused for approval (same run and LangGraph thread). Selected ids must be
-    among the proposed candidates; only those are downloaded."""
+    """Resumes a run paused for approval of one furniture item (same run and LangGraph thread).
+    Decisions for another item or an earlier search run are refused (409); selected ids must be
+    among this item's candidates (422); only those are downloaded."""
     run = _get_run(run_id)
     if run.status != "waiting_for_approval" or not run.pending_approval:
         raise HTTPException(409, "This run is not waiting for an approval.")
+    if body.itemKey != run.pending_approval.get("itemKey") or body.run not in (None, run.pending_approval.get("run")):
+        raise HTTPException(409, "This decision is outdated: another furniture item is waiting for approval.")
     try:
-        decision = validate_decision(run.pending_approval.get("candidates", []), body.model_dump())
+        decision = validate_decision(run.pending_approval, body.model_dump())
     except ApprovalError as exc:
         raise HTTPException(422, str(exc))
     # Claim the approval before anything awaits, so a second click cannot resume twice.

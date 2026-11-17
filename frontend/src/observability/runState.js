@@ -44,7 +44,8 @@ export function deriveRun(events) {
     latestByNode: new Map(),
     counts: { completed: 0, failed: 0, running: 0, waiting: 0 },
     usage: emptyUsage(),
-    approval: null,       // pending human-in-the-loop request while status is 'waiting'
+    approval: null,       // pending human-in-the-loop request (one furniture item) while status is 'waiting'
+    research: null,       // latest furniture list progress {counts, total}
     waitMs: 0,            // finished waiting periods; the current one is added live
     waitingSince: null
   };
@@ -120,6 +121,7 @@ export function deriveRun(events) {
             summary: p.summary ?? null, next: p.next ?? null, waitMs: p.waitMs ?? ex.waitMs, waitingSince: null
           });
           if (p.output?.intent) run.intent = p.output.intent;
+          if (e.node === 'furniture_research' && p.output?.research_status === 'done') run.research = null;
           // Stages still open when the node ended were interrupted.
           ex.stages.forEach((s) => {
             if (s.status === 'running') Object.assign(s, { status: 'failed', endedAt: e.ts, durationMs: e.ts - s.startedAt });
@@ -128,6 +130,8 @@ export function deriveRun(events) {
         break;
       case 'node.progress':
         if (ex) upsertStage(ex.stages, p, e.ts);
+        // Latest state of the furniture list (counts per item status, online budget used).
+        if (p.stage === 'research_status') run.research = p.data;
         break;
       case 'node.llm':
         if (ex) {
@@ -147,6 +151,44 @@ export function deriveRun(events) {
     if (ex.status in run.counts) run.counts[ex.status] += 1;
   }
   return run;
+}
+
+// Nodes that work on one furniture list together. Downloads run in the background, so the graph
+// alternates between them (research -> download -> research -> approval ...) for the same list.
+const RESEARCH_NODES = new Set(['furniture_research', 'asset_download', 'human_approval']);
+const GROUP_STATUS = ['failed', 'waiting', 'running', 'cancelled'];
+
+// Timeline rows: single executions, or one group per furniture list (consecutive research nodes).
+export function groupTimeline(executions) {
+  const rows = [];
+  for (const ex of executions) {
+    const last = rows.at(-1);
+    if (RESEARCH_NODES.has(ex.node) && last?.executions && RESEARCH_NODES.has(last.executions[0].node)) {
+      last.executions.push(ex);
+    } else {
+      rows.push(RESEARCH_NODES.has(ex.node) ? { id: `group:${ex.executionId}`, executions: [ex] } : ex);
+    }
+  }
+  return rows.map((row) => {
+    if (!row.executions) return row;
+    if (row.executions.length === 1) return row.executions[0];
+    const list = row.executions;
+    const statuses = new Set(list.map((e) => e.status));
+    const usage = emptyUsage();
+    for (const e of list) {
+      for (const key of ['promptTokens', 'completionTokens', 'reasoningTokens', 'totalTokens', 'cost', 'calls']) usage[key] += e.usage[key];
+      usage.hasCost ||= e.usage.hasCost;
+    }
+    const lastResearch = [...list].reverse().find((e) => e.node === 'furniture_research' && e.summary);
+    return {
+      ...row,
+      status: GROUP_STATUS.find((s) => statuses.has(s)) ?? 'completed',
+      startedAt: list[0].startedAt,
+      endedAt: list.every((e) => e.endedAt != null) ? list.at(-1).endedAt : null,
+      summary: lastResearch?.summary ?? null,
+      usage
+    };
+  });
 }
 
 // Duration of something that may still be running, using server timestamps corrected by the clock offset.
